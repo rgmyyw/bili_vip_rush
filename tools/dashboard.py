@@ -20,6 +20,12 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from core.auth import (                     # noqa: E402
+    credentials_view,
+    qrcode_poll,
+    qrcode_start,
+    save_credentials,
+)
 from core.client import BiliClient          # noqa: E402
 from core.logstats import (                 # noqa: E402
     failure_breakdown,
@@ -122,6 +128,35 @@ PAGE = """<!DOCTYPE html>
   </div>
  </div>
 </div>
+<div class="card" id="credcard" style="margin-bottom:18px">
+ <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+  <div><b>登录凭证</b> <span id="cstate" class="tag done">加载中</span>
+    <span class="muted" id="csummary" style="margin-left:8px"></span></div>
+  <div style="display:flex;gap:8px">
+   <button onclick="verifyCred()">验证</button>
+   <button onclick="qrLogin()">扫码登录</button>
+   <button onclick="toggleCredForm()">手动更新</button>
+  </div>
+ </div>
+ <div id="qrbox" style="display:none;margin-top:14px;text-align:center">
+  <div id="qrgrid" style="display:inline-block"></div>
+  <div id="qrmsg" class="muted" style="margin-top:8px">用手机 B站 App 扫码并确认登录</div>
+ </div>
+ <div id="cform" style="display:none;margin-top:12px">
+  <div class="muted" style="margin-bottom:8px">粘贴抓包凭证（留空=不修改该字段；与本地 secrets.py 字段级共存）</div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">
+   <div><div class="k">access_key (App)</div><input id="c_access_key"></div>
+   <div><div class="k">csrf (App)</div><input id="c_csrf"></div>
+   <div><div class="k">SESSDATA (Web)</div><input id="c_sessdata"></div>
+   <div><div class="k">bili_jct (Web)</div><input id="c_bili_jct"></div>
+   <div><div class="k">DedeUserID</div><input id="c_uid"></div>
+  </div>
+  <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+   <button onclick="saveCred()">保存凭证</button>
+   <span id="cmsg" class="muted"></span>
+  </div>
+ </div>
+</div>
 <table id="runs"><thead><tr>
  <th>开始时间</th><th>模式</th><th>结果</th><th>尝试</th><th>HTTP</th><th>耗时</th><th>订单</th>
 </tr></thead><tbody></tbody></table>
@@ -216,17 +251,27 @@ async function refreshNotify(){
   const st = document.getElementById("nstate");
   st.textContent = c.enabled ? "已启用" : "未配置";
   st.className = "tag " + (c.enabled ? "success" : "done");
-  document.getElementById("nsummary").textContent =
-    c.enabled ? `${c.user} → ${c.to} (${c.host}:${c.port}, 授权码${c.pass_set?"已设":"未设"})`
-              : "抢购结束不会发邮件，点击右侧配置";
+  const src = c.sources || {};
+  document.getElementById("nsummary").textContent = c.enabled
+    ? `${c.user} → ${c.to} (${c.host}:${c.port}) · 来源: ${src.host}服务器/${src.pass}授权码`
+    : "抢购结束不会发邮件，点击右侧配置（本地 secrets.py 或表单均可）";
   if(document.getElementById("nform").style.display === "block" &&
      !document.getElementById("f_host").value){
-    document.getElementById("f_host").value = c.host || "";
-    document.getElementById("f_port").value = c.port || 465;
-    document.getElementById("f_user").value = c.user || "";
-    document.getElementById("f_to").value = (c.to === c.user) ? "" : (c.to || "");
+    // 只预填来源为"仪表盘"的值；本地/环境变量来源留空，保存时回落，
+    // 避免把本地配置固化进 notify.json
+    document.getElementById("f_host").value =
+      src.host === "仪表盘" ? (c.host || "") : "";
+    document.getElementById("f_host").placeholder =
+      src.host !== "仪表盘" && c.host ? `本地已配 ${c.host}，填写则覆盖` : "smtp.qq.com";
+    document.getElementById("f_port").value = (src.host === "仪表盘") ? c.port : 465;
+    document.getElementById("f_user").value =
+      src.user === "仪表盘" ? (c.user || "") : "";
+    document.getElementById("f_user").placeholder =
+      src.user !== "仪表盘" && c.user ? `本地已配 ${c.user}，填写则覆盖` : "you@qq.com";
+    document.getElementById("f_to").value =
+      src.to === "仪表盘" ? ((c.to === c.user) ? "" : (c.to || "")) : "";
     document.getElementById("f_pass").placeholder =
-      c.pass_set ? "已设置，留空则不修改" : "邮箱设置里生成的授权码";
+      c.pass_set ? `已设置(来源:${src.pass})，留空则用本地配置` : "邮箱设置里生成的授权码";
   }
 }
 function toggleForm(){
@@ -254,9 +299,97 @@ async function testMail(){
   msg.textContent = d.ok ? "测试邮件已发送，请查收" : d.error;
 }
 
+/* ---------------- 登录凭证卡 ---------------- */
+async function refreshCred(){
+  const c = await j("/api/credentials");
+  const st = document.getElementById("cstate");
+  const complete = c.set && c.set.access_key && c.set.sessdata;
+  st.textContent = complete ? "已配置" : "不完整";
+  st.className = "tag " + (complete ? "success" : "credential_expired");
+  const src = c.sources || {};
+  document.getElementById("csummary").textContent =
+    `UID ${c.uid} · access_key ${c.set.access_key ? c.access_key + "(" + src.access_key + ")" : "未设"} · SESSDATA ${c.set.sessdata ? "(" + src.sessdata + ")" : "未设"}` +
+    (c.updated_at ? ` · 更新于 ${c.updated_at}(${c.updated_by})` : "");
+}
+function toggleCredForm(){
+  const f = document.getElementById("cform");
+  f.style.display = f.style.display === "block" ? "none" : "block";
+}
+async function saveCred(){
+  const msg = document.getElementById("cmsg");
+  msg.textContent = "保存中...";
+  const r = await fetch("/api/credentials", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      access_key: c_access_key.value.trim(), csrf: c_csrf.value.trim(),
+      sessdata: c_sessdata.value.trim(), bili_jct: c_bili_jct.value.trim(),
+      uid: c_uid.value.trim()})});
+  const d = await r.json();
+  msg.textContent = d.error ? d.error : "已保存，立即生效（可用上方\"验证\"实测）";
+  ["c_access_key","c_csrf","c_sessdata","c_bili_jct","c_uid"].forEach(id=>{
+    document.getElementById(id).value = "";});
+  refreshCred();
+}
+async function verifyCred(){
+  const st = document.getElementById("cstate");
+  st.textContent = "验证中...";
+  const d = await j("/api/summary");
+  st.textContent = d.ok ? "有效 ✓" : "失效/异常";
+  st.className = "tag " + (d.ok ? "success" : "credential_expired");
+}
+let qrTimer = null;
+async function qrLogin(){
+  document.getElementById("qrbox").style.display = "block";
+  document.getElementById("qrmsg").textContent = "生成二维码...";
+  document.getElementById("qrgrid").innerHTML = "";
+  const d = await j2("/api/qrcode/start", "POST");
+  if(d.error){
+    document.getElementById("qrmsg").textContent = d.error;
+    return;
+  }
+  renderQR(d.matrix);
+  document.getElementById("qrmsg").textContent =
+    "用手机 B站 App 扫码并确认登录" + (d.qr_error ? "（"+d.qr_error+"）" : "");
+  if(qrTimer) clearInterval(qrTimer);
+  qrTimer = setInterval(async ()=>{
+    const p = await j2("/api/qrcode/poll", "POST", {auth_code: d.auth_code});
+    const m = document.getElementById("qrmsg");
+    if(p.status === "success"){
+      clearInterval(qrTimer); m.textContent = "✓ " + p.message;
+      setTimeout(()=>{document.getElementById("qrbox").style.display="none";}, 2000);
+      refreshCred();
+    } else if(p.status === "expired" || p.status === "error"){
+      clearInterval(qrTimer); m.textContent = p.message;
+    } else if(p.status === "scanned"){
+      m.textContent = p.message;
+    }
+  }, 2000);
+}
+function renderQR(matrix){
+  if(!matrix){ return; }
+  const n = matrix.length, cell = Math.max(3, Math.min(8, Math.floor(240/n)));
+  const grid = document.getElementById("qrgrid");
+  grid.innerHTML = "";
+  grid.style.display = "grid";
+  grid.style.gridTemplateColumns = `repeat(${n}, ${cell}px)`;
+  grid.style.gap = "0";
+  grid.style.background = "#fff"; grid.style.padding = "8px"; grid.style.borderRadius = "8px";
+  matrix.forEach(row => row.forEach(v=>{
+    const d = document.createElement("div");
+    d.style.width = cell+"px"; d.style.height = cell+"px";
+    d.style.background = v ? "#000" : "#fff";
+    grid.appendChild(d);
+  }));
+}
+async function j2(u, method, body){
+  const r = await fetch(u, {method, headers:{"Content-Type":"application/json"},
+    body: body ? JSON.stringify(body) : null});
+  return r.json();
+}
+
 setInterval(()=>{document.getElementById("clock").textContent =
   new Date().toLocaleString("zh-CN");}, 1000);
-refreshLive(); refreshRuns(); refreshNotify();
+refreshLive(); refreshRuns(); refreshNotify(); refreshCred();
 setInterval(refreshLive, 5000);
 setInterval(refreshRuns, 10000);
 </script></body></html>"""
@@ -295,6 +428,36 @@ class Handler(BaseHTTPRequestHandler):
                            "抢购成功后会推送订单号与支付链接。")
             return self._json({"ok": ok,
                                "error": "" if ok else "发送失败: 检查授权码/端口/发件人"})
+        if path == "/api/credentials":
+            # 表单短字段名 -> credentials.json 键
+            mapping = {"access_key": "bili_access_key", "csrf": "bili_csrf",
+                       "sessdata": "bili_sessdata", "bili_jct": "bili_jct",
+                       "uid": "bili_uid"}
+            creds = {mapping[k]: v for k, v in body.items() if k in mapping}
+            try:
+                return self._json(save_credentials(creds, source="仪表盘"))
+            except Exception as ex:
+                return self._json({"error": f"保存失败: {ex}"[:200]}, 500)
+        if path == "/api/qrcode/start":
+            try:
+                start = qrcode_start()
+            except Exception as ex:
+                return self._json({"error": f"{ex}"[:200]}, 500)
+            try:
+                import qrcode as _qr
+                qr = _qr.QRCode(border=1)
+                qr.add_data(start["url"])
+                start["matrix"] = qr.get_matrix()
+            except Exception as ex:       # qrcode 库缺失时退化为仅链接
+                start["matrix"] = None
+                start["qr_error"] = f"二维码渲染失败({ex})，请安装: pip install qrcode"
+            return self._json(start)
+        if path == "/api/qrcode/poll":
+            auth_code = str(body.get("auth_code") or "")
+            if not auth_code:
+                return self._json({"status": "error",
+                                   "message": "缺少 auth_code"}, 400)
+            return self._json(qrcode_poll(auth_code))
         return self._json({"error": "not found"}, 404)
 
     def do_GET(self):
@@ -312,6 +475,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(list_runs(LOGS_DIR))
         elif path == "/api/notify-config":
             self._json(notify_config_view())
+        elif path == "/api/credentials":
+            self._json(credentials_view())
         elif path.startswith("/api/runs/"):
             name = path[len("/api/runs/"):]
             f = (LOGS_DIR / name)
@@ -330,6 +495,20 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8777)
     args = ap.parse_args()
+
+    # Windows 下 SO_REUSEADDR 允许多进程双绑定同一端口，旧进程会抢答请求。
+    # 启动前主动探测，被占用则直接报错退出，避免出现"幽灵旧进程"。
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((args.host, args.port))
+    except OSError:
+        print(f"端口 {args.host}:{args.port} 已被占用（可能有旧仪表盘进程）。"
+              f"请先结束旧进程再启动。")
+        return 1
+    finally:
+        probe.close()
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"仪表盘: http://{args.host}:{args.port}  (Ctrl+C 退出)")

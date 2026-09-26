@@ -79,6 +79,13 @@ def run_target_ts(args) -> float | None:
 
 def run_one_cycle(mode: str, args) -> int:
     """执行一轮完整流程（独立的日志文件）。返回退出码。"""
+    # 仪表盘/扫码更新的凭证与邮件配置（credentials.json/notify.json）
+    # 常驻进程每轮开始前重载，改配置无需重启
+    from core.auth import reload_credentials_into_settings
+    from core.notify import reload_notify_into_settings
+    reload_credentials_into_settings()
+    reload_notify_into_settings()
+
     logs = RunLogger(LOGS_DIR, mode=mode)
     logs.log_meta(event="argv", argv=sys.argv[1:])   # run_start 已在构造时写入
     print(f"日志文件: {logs.path}")

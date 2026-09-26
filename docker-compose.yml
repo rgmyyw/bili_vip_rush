@@ -24,8 +24,9 @@ services:
       # - BILI_NOTIFY_TO=me@qq.com
     volumes:
       - ./logs:/app/logs
-      # 仪表盘保存的邮件配置（含授权码），两个服务共用：
+      # 仪表盘保存的邮件配置与登录凭证（扫码更新），两个服务共用：
       - ./config/notify.json:/app/config/notify.json
+      - ./config/credentials.json:/app/config/credentials.json
 
   # 仪表盘：http://127.0.0.1:8777 （实时状态/抢购记录/调用明细/邮件配置）
   bili-dashboard:

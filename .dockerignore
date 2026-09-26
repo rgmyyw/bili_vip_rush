@@ -12,6 +12,7 @@ __pycache__/
 .pytest_cache/
 config/secrets.py
 config/notify.json
+config/credentials.json
 tests/test_signer_har.py
 README.md
 requirements-dev.txt

@@ -6,6 +6,7 @@
 """
 import json
 import logging
+import os
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -30,8 +31,40 @@ def notify_enabled() -> bool:
     return bool(settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASS)
 
 
+def _notify_json() -> dict:
+    try:
+        return json.loads(settings.NOTIFY_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def reload_notify_into_settings():
+    """常驻进程每轮前调用：按 env > notify.json > secrets.py 重载邮件配置。"""
+    from config import settings as settings_mod
+    settings_mod.SMTP_HOST = settings_mod._cred(
+        "BILI_SMTP_HOST", "SMTP_HOST", "host") or ""
+    settings_mod.SMTP_PORT = int(
+        settings_mod._cred("BILI_SMTP_PORT", "SMTP_PORT", "port") or 465)
+    settings_mod.SMTP_USER = settings_mod._cred(
+        "BILI_SMTP_USER", "SMTP_USER", "user") or ""
+    settings_mod.SMTP_PASS = settings_mod._cred(
+        "BILI_SMTP_PASS", "SMTP_PASS", "pass") or ""
+    settings_mod.NOTIFY_TO = (
+        settings_mod._cred("BILI_NOTIFY_TO", "NOTIFY_TO", "to")
+        or settings_mod.SMTP_USER)
+
+
+def _field_source(env_name: str, json_key: str) -> str:
+    """字段值来源：环境变量 / 仪表盘 / 本地文件 / 未配置。"""
+    if os.environ.get(env_name):
+        return "环境变量"
+    if _notify_json().get(json_key):
+        return "仪表盘"
+    return "本地文件"
+
+
 def notify_config_view() -> dict:
-    """仪表盘用的配置视图：授权码不回传，只返回是否已设置。"""
+    """仪表盘用的配置视图：授权码不回传，只返回是否已设置与各字段来源。"""
     return {
         "enabled": notify_enabled(),
         "host": settings.SMTP_HOST,
@@ -39,35 +72,56 @@ def notify_config_view() -> dict:
         "user": settings.SMTP_USER,
         "to": settings.NOTIFY_TO,
         "pass_set": bool(settings.SMTP_PASS),
+        "sources": {
+            "host": _field_source("BILI_SMTP_HOST", "host"),
+            "user": _field_source("BILI_SMTP_USER", "user"),
+            "pass": _field_source("BILI_SMTP_PASS", "pass"),
+            "to": _field_source("BILI_NOTIFY_TO", "to"),
+        },
     }
 
 
-def save_notify_config(cfg: dict) -> dict:
-    """仪表盘保存邮件配置到 config/notify.json，并让本进程立即生效。
+# 仪表盘表单字段 -> (环境变量, notify.json 键) 映射，save/reload 共用
+_FORM_FIELDS = {
+    "host": "BILI_SMTP_HOST",
+    "user": "BILI_SMTP_USER",
+    "pass": "BILI_SMTP_PASS",
+    "to": "BILI_NOTIFY_TO",
+}
 
-    cfg: {host, port, user, pass, to}；pass 留空表示保留现有授权码。
+
+def save_notify_config(cfg: dict) -> dict:
+    """仪表盘保存邮件配置（字段级合并，与本地配置共存生效）。
+
+    合并规则——只持久化表单里明确填写的字段：
+      - 字段有值 -> 写入 notify.json 的对应键；
+      - 字段留空 -> 删除该键，回落到 secrets.py / 环境变量的值；
+      - 未提交的字段（None）-> 保持 notify.json 现状。
+    读取优先级（字段级）：环境变量 > notify.json > secrets.py。
     """
     from config import settings as settings_mod
 
-    host = (cfg.get("host") or "").strip()
-    port = int(cfg.get("port") or 465)
-    user = (cfg.get("user") or "").strip()
-    to = (cfg.get("to") or "").strip()
-    password = (cfg.get("pass") or "").strip()
-    if not password:
-        password = settings.SMTP_PASS   # 留空保留旧授权码
+    try:
+        merged = _notify_json()
+    except Exception:
+        merged = {}
+    if not isinstance(merged, dict):
+        merged = {}
 
-    data = {"host": host, "port": port, "user": user,
-            "pass": password, "to": to}
+    for key in ("host", "port", "user", "pass", "to"):
+        val = cfg.get(key)
+        if val is None:
+            continue                      # 未提交：保持现状
+        val = str(val).strip()
+        if not val:
+            merged.pop(key, None)         # 显式清空：删键回落本地配置
+            continue
+        merged[key] = int(val) if key == "port" else val
+
     settings.NOTIFY_JSON_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 本进程立即生效（无需重启仪表盘/抢购进程）
-    settings_mod.SMTP_HOST = host
-    settings_mod.SMTP_PORT = port
-    settings_mod.SMTP_USER = user
-    settings_mod.SMTP_PASS = password
-    settings_mod.NOTIFY_TO = to or user
+    reload_notify_into_settings()
     return notify_config_view()
 
 

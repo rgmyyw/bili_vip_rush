@@ -187,6 +187,7 @@ secrets.py。
 ```
 config/settings.py    # 凭证 + 套餐 + 接口 + 节奏配置（改这里；凭证可被环境变量覆盖）
 core/signer.py        # App 签名（HAR 黄金用例验证）
+core/auth.py        # TV 扫码登录（一次拿全套凭证）+ credentials.json 管理
 core/classifier.py    # 五态响应分类器（凭证失效/已购/售罄/系统错误/重试）
 core/client.py        # 接口客户端（状态/预约/资格/下单/预热）+ HTTP 审计
 core/run_logger.py    # 运行日志：审计/事件/脱敏/调用链
@@ -204,23 +205,20 @@ logs/                 # 运行日志（JSONL，一次运行一个文件）
 
 ## 凭证维护（重要）
 
-凭证**不进 git、不进镜像**。两种提供方式（优先级：环境变量 > 本地文件）：
+凭证**不进 git、不进镜像**。三种提供方式（字段级优先级：环境变量 >
+credentials.json（仪表盘/扫码）> secrets.py），本地配置与仪表盘配置共存生效：
 
-1. **本地文件**：`cp config/secrets.example.py config/secrets.py`，填入抓包
-   凭证（`secrets.py` 已被 `.gitignore` / `.dockerignore` 排除）。
-2. **环境变量**（Docker 推荐）：
-   ```yaml
-   environment:
-     - BILI_ACCESS_KEY=xxx
-     - BILI_CSRF=xxx
-     - BILI_SESSDATA=xxx
-     - BILI_BILI_JCT=xxx
-     - BILI_DEDE_USER_ID=xxx
-   ```
+1. **仪表盘扫码登录（推荐）**：仪表盘"登录凭证"卡点"扫码登录"，手机
+   B站 App 扫码确认后自动获取全套凭证（access_key/SESSDATA/bili_jct，
+   走 TV 端登录协议），保存到 `config/credentials.json` 并立即生效。
+   常驻抢购进程每轮开始前自动重载，改凭证无需重启。
+2. **仪表盘手动更新**：同一张卡的"手动更新"表单粘贴抓包凭证（留空字段
+   不修改，与本地配置字段级合并）。
+3. **本地文件**：`cp config/secrets.example.py config/secrets.py` 填入
+   抓包凭证；或环境变量 `BILI_ACCESS_KEY` 等注入（Docker 推荐）。
 
-若接口返回 `-101`（未登录）或 `-111`（csrf 失效），抢购会立即停止并提示
-更新凭证——重新抓包后更新 `secrets.py` 或环境变量即可。这些都是**账号登录
-凭证，不要外传**。
+接口返回 `-101`（未登录）或 `-111`（csrf 失效）时抢购立即停止并提示——
+扫码或更新凭证即可。这些都是**账号登录凭证，不要外传**。
 
 ## 测试
 

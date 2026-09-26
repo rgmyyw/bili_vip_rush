@@ -14,6 +14,8 @@ from pathlib import Path
 
 # 仪表盘保存的邮件配置文件（含授权码，不入 git/镜像）
 NOTIFY_JSON_PATH = Path(__file__).resolve().parent / "notify.json"
+# 仪表盘保存/扫码登录刷新的登录凭证文件（不入 git/镜像）
+CREDENTIALS_JSON_PATH = Path(__file__).resolve().parent / "credentials.json"
 
 try:
     from config import secrets as _secrets
@@ -38,12 +40,21 @@ def _notify_json() -> dict:
         return {}
 
 
+def _credentials_json() -> dict:
+    try:
+        return _json.loads(CREDENTIALS_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def _cred(env_name: str, attr: str, json_key: str | None = None) -> str:
     val = os.environ.get(env_name)
     if val:
         return val
     if json_key:
-        val = _notify_json().get(json_key)
+        source = (_credentials_json() if json_key.startswith("bili_")
+                  else _notify_json())
+        val = source.get(json_key)
         if val:
             return str(val)
     return getattr(_secrets, attr)
@@ -52,11 +63,11 @@ def _cred(env_name: str, attr: str, json_key: str | None = None) -> str:
 # ----------------------------------------------------------------------------
 # 登录凭证（环境变量或 config/secrets.py，本文件不再存放明文）
 # ----------------------------------------------------------------------------
-ACCESS_KEY = _cred("BILI_ACCESS_KEY", "ACCESS_KEY")
-CSRF = _cred("BILI_CSRF", "CSRF")
-BILI_JCT = _cred("BILI_BILI_JCT", "BILI_JCT")
-SESSDATA = _cred("BILI_SESSDATA", "SESSDATA")
-DEDE_USER_ID = _cred("BILI_DEDE_USER_ID", "DEDE_USER_ID")
+ACCESS_KEY = _cred("BILI_ACCESS_KEY", "ACCESS_KEY", "bili_access_key")
+CSRF = _cred("BILI_CSRF", "CSRF", "bili_csrf")
+BILI_JCT = _cred("BILI_BILI_JCT", "BILI_JCT", "bili_jct")
+SESSDATA = _cred("BILI_SESSDATA", "SESSDATA", "bili_sessdata")
+DEDE_USER_ID = _cred("BILI_DEDE_USER_ID", "DEDE_USER_ID", "bili_uid")
 
 # ----------------------------------------------------------------------------
 # 邮件推送（环境变量 > notify.json（仪表盘）> secrets.py；齐备才启用）
