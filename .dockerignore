@@ -1,0 +1,16 @@
+# 与运行无关的内容不进镜像（含敏感测试数据/本地日志/明文凭证）
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+logs/
+tests/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+config/secrets.py
+tests/test_signer_har.py
+README.md
+requirements-dev.txt

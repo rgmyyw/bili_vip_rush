@@ -1,0 +1,16 @@
+# 登录凭证（本地私有，从 config/secrets.example.py 复制创建）
+config/secrets.py
+# 真实抓包数据对拍用例（含真实凭证）
+tests/test_signer_har.py
+
+# 运行日志（含请求现场，凭证已脱敏，但不必进仓库）
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地环境
+.env
+*.local.py

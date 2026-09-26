@@ -1,0 +1,28 @@
+services:
+  bili-rush:
+    build: .
+    image: bili-vip-rush:latest
+    container_name: bili-rush
+    # 常驻：每天 11:50 启动一轮抢购（开售时刻以服务器 next_open_at 为准，
+    # 11:50 只是起跑线，脚本会校时后等到 12:00）
+    command: ["--daemon", "11:50"]
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      # 凭证注入：镜像不含任何凭证（secrets.py 被 .dockerignore 排除），
+      # 必须通过环境变量传入，或挂载本地 config/secrets.py：
+      # - BILI_ACCESS_KEY=xxx
+      # - BILI_CSRF=xxx
+      # - BILI_SESSDATA=xxx
+      # - BILI_BILI_JCT=xxx
+      # - BILI_DEDE_USER_ID=xxx
+    volumes:
+      - ./logs:/app/logs
+
+# 常用操作：
+#   docker compose build
+#   docker compose run --rm bili-rush --check      # 只读预检
+#   docker compose up -d                           # 常驻自动抢
+#   docker compose logs -f bili-rush               # 看抢购输出
+#   宿主机复盘: python tools/replay.py logs/run_xxx.jsonl
+#   或容器内:  docker compose exec bili-rush python tools/replay.py
