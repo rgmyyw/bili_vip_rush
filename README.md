@@ -138,6 +138,23 @@ docker compose logs -f bili-rush
 本地开发用 `pip install -r requirements-dev.txt`（含 pytest）；运行镜像只装
 `requirements.txt`（requests）。
 
+## 仪表盘
+
+```bash
+python tools/dashboard.py            # http://127.0.0.1:8777
+```
+
+- **实时状态卡**：开售状态（开售中/今日售罄/即将开售）、距下次开售倒计时、
+  预约/已购、凭证有效性（5s 自动刷新，服务端代理调用 attract_card）。
+- **抢购记录**：每次运行的模式/结果（success/sold_out/credential_expired/
+  timeout…）、尝试次数、订单号与支付直达链接；点击行展开**调用明细**
+  （HTTP 序列 + 失败分类 + 事件时间线）。
+- 零第三方依赖（标准库实现），解析层与 `tools/replay.py` 共用
+  （`core/logstats.py`）。
+
+Docker 下仪表盘是独立服务：`docker compose up -d` 后访问
+`http://<宿主机>:8777`。
+
 ## 目录结构
 
 ```
@@ -146,9 +163,11 @@ core/signer.py        # App 签名（HAR 黄金用例验证）
 core/classifier.py    # 五态响应分类器（凭证失效/已购/售罄/系统错误/重试）
 core/client.py        # 接口客户端（状态/预约/资格/下单/预热）+ HTTP 审计
 core/run_logger.py    # 运行日志：审计/事件/脱敏/调用链
+core/logstats.py      # 运行汇总/失败分类（replay 与 dashboard 共用）
 core/time_sync.py     # 服务器时钟校准
 flows/rush.py         # 抢购流程（预检→校时→等待→开抢→熔断）
 tools/replay.py       # 复盘报告（失败分类/调用序列/原文现场）
+tools/dashboard.py    # Web 仪表盘（实时状态/抢购记录/调用明细）
 tests/                # pytest，全部 mock 网络层，无真机/无真实请求
 main.py               # CLI 入口（一次性命令 + --daemon 常驻调度）
 Dockerfile            # python:3.12-slim + Asia/Shanghai 时区

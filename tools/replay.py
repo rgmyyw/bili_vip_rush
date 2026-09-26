@@ -1,34 +1,30 @@
 # -*- coding: utf-8 -*-
 """复盘报告：读取 run_*.jsonl，输出调用序列 / 失败分类 / 关键响应原文。
 
+解析逻辑在 core/logstats.py，与仪表盘(tools/dashboard.py)共用。
+
 用法：
     python tools/replay.py                     # 复盘最近一次运行
     python tools/replay.py logs/run_xxx.jsonl  # 复盘指定文件
 """
 import json
 import sys
-from collections import Counter
 from pathlib import Path
 
-LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from core.logstats import (          # noqa: E402
+    failure_breakdown,
+    list_runs,
+    load_rows,
+)
+
+LOGS_DIR = ROOT / "logs"
 
 # 复盘时重点关注的接口（抢购链路关键环节）
 KEY_APIS = ("create/activity", "reserve", "attract_card",
             "buyComponentEvo_info")
-
-
-def load_rows(path: Path) -> list:
-    rows = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                rows.append({"type": "corrupt", "raw": line})
-    return rows
 
 
 def fmt_row(no: int, r: dict) -> str:
@@ -70,18 +66,10 @@ def report(path: Path):
     for i, r in enumerate(rows, 1):
         print(fmt_row(i, r))
 
-    # 失败分类：接口层 code != 0 或 HTTP 异常
-    fails = []
-    for r in http_rows:
-        resp = r.get("response", {})
-        if r.get("error"):
-            fails.append((r.get("api", ""), "NETWORK", r["error"][:60]))
-        elif resp.get("api_code") not in (None, 0):
-            fails.append((r.get("api", ""), resp["api_code"],
-                          resp.get("message", "")[:60]))
-    if fails:
+    failures = failure_breakdown(rows)
+    if failures:
         print("\n---------- 失败分类（接口/错误码/信息 -> 次数） ----------")
-        for (api, code, msg), cnt in Counter(fails).most_common():
+        for api, code, msg, cnt in failures:
             print(f"  {api[:34]:<34} code={code:<6} ×{cnt:<3} {msg}")
 
     # 关键接口响应原文（迭代脚本时看这里：新字段/新风控提示都在原文里）
@@ -89,6 +77,7 @@ def report(path: Path):
                 if any(k in (r.get("api") or "") for k in KEY_APIS)]
     if key_rows:
         print("\n---------- 关键接口响应原文（去重，最多各3条） ----------")
+        from collections import Counter
         seen: Counter = Counter()
         for r in key_rows:
             api = r.get("api", "")

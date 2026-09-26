@@ -19,6 +19,20 @@ services:
     volumes:
       - ./logs:/app/logs
 
+  # 仪表盘：http://127.0.0.1:8777 （实时状态/抢购记录/调用明细）
+  bili-dashboard:
+    image: bili-vip-rush:latest
+    container_name: bili-dashboard
+    command: ["python", "tools/dashboard.py", "--host", "0.0.0.0", "--port", "8777"]
+    restart: unless-stopped
+    ports:
+      - "8777:8777"
+    environment:
+      - TZ=Asia/Shanghai
+      # 凭证注入同上（BILI_ACCESS_KEY 等），与抢购服务保持一致
+    volumes:
+      - ./logs:/app/logs
+
 # 常用操作：
 #   docker compose build
 #   docker compose run --rm bili-rush --check      # 只读预检
