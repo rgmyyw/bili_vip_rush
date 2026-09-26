@@ -16,6 +16,12 @@ services:
       # - BILI_SESSDATA=xxx
       # - BILI_BILI_JCT=xxx
       # - BILI_DEDE_USER_ID=xxx
+      # 邮件推送（选配，齐备才启用）：
+      # - BILI_SMTP_HOST=smtp.qq.com
+      # - BILI_SMTP_PORT=465
+      # - BILI_SMTP_USER=you@qq.com
+      # - BILI_SMTP_PASS=授权码
+      # - BILI_NOTIFY_TO=me@qq.com
     volumes:
       - ./logs:/app/logs
 

@@ -14,3 +14,11 @@ CSRF = ""
 BILI_JCT = ""
 SESSDATA = ""
 DEDE_USER_ID = ""
+
+# --- 邮件推送（选配，留空=禁用）---
+# SMTP_PASS 是邮箱"授权码"（QQ邮箱: 设置->账号->开启SMTP->生成授权码）
+SMTP_HOST = ""        # 例: smtp.qq.com
+SMTP_PORT = 465       # 465=SSL, 587=STARTTLS
+SMTP_USER = ""        # 发件邮箱
+SMTP_PASS = ""        # SMTP 授权码
+NOTIFY_TO = ""        # 收件邮箱，留空=发给自己

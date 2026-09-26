@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from core.client import BiliClient
+from core.notify import notify_enabled, notify_rush_result
 from core.run_logger import RunLogger
 from flows.rush import RushFlow
 
@@ -46,6 +47,8 @@ def parse_args():
     ap.add_argument("--daemon", metavar="HH:MM[:SS]",
                     help="常驻模式：每天该时刻自动执行一轮抢购（开售时间以"
                          "服务器 next_open_at 为准）")
+    ap.add_argument("--test-notify", action="store_true",
+                    help="发送测试邮件，验证 SMTP 配置")
     ap.add_argument("-v", "--verbose", action="store_true")
     return ap.parse_args()
 
@@ -108,6 +111,12 @@ def run_one_cycle(mode: str, args) -> int:
             else:
                 print("本轮未抢到。复盘: python tools/replay.py")
                 exit_code = 1
+            # 邮件推送（未配置则静默跳过；成功邮件含支付链接）
+            if notify_enabled() and flow.last_result:
+                flow.last_result["log_file"] = logs.path.name
+                sent = notify_rush_result(flow.last_result)
+                logs.log_event("notify", sent=sent,
+                               result=flow.last_result.get("result"))
     except KeyboardInterrupt:
         logs.log_meta(event="run_interrupted", reason="KeyboardInterrupt")
         print("\n手动中断，日志已保存")
@@ -117,6 +126,9 @@ def run_one_cycle(mode: str, args) -> int:
         logs.log_meta(event="run_crashed", error=repr(ex),
                       traceback=traceback.format_exc())
         logging.exception("运行异常，现场已写入日志")
+        if notify_enabled():
+            notify_rush_result({"result": "crashed",
+                                "log_file": logs.path.name})
         exit_code = 2
     finally:
         logs.log_meta(event="run_end", exit_code=exit_code)
@@ -148,6 +160,18 @@ def main():
                 raise
             # 未预期异常已在 run_one_cycle 内兜底，这里继续下一周期
         return 0
+
+    if args.test_notify:
+        from core.notify import notify_enabled, send_mail
+        if not notify_enabled():
+            print("邮件通知未配置：请在 config/secrets.py 或环境变量 "
+                  "BILI_SMTP_HOST/USER/PASS 填写 SMTP 信息")
+            return 1
+        ok = send_mail("[B站抢购] 测试邮件",
+                       "收到这封邮件说明抢购结果推送配置成功。\n"
+                       "抢购成功后会推送订单号与支付链接。")
+        print("测试邮件发送", "成功，请查收" if ok else "失败，检查授权码/端口")
+        return 0 if ok else 1
 
     if not (args.check or args.reserve or args.rush):
         print(__doc__)

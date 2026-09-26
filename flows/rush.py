@@ -69,6 +69,7 @@ class RushFlow:
         self.plans = plans if plans is not None else settings.plan_payloads()
         self.logs = run_logger or RunLogger(log_dir, mode="rush")
         self.client.run_logger = self.logs
+        self.last_result: dict = {}   # rush() 结束后的结果摘要（通知用）
 
     # -------------------------------------------------------------- helpers
     def _set_phase(self, phase: str):
@@ -169,6 +170,8 @@ class RushFlow:
                 self._record("stop_reason", reason="max_attempts",
                              attempts=attempt - 1)
                 logger.warning("达到尝试上限 %s 次", settings.RUSH_MAX_ATTEMPTS)
+                self.last_result = {"result": "max_attempts",
+                                    "attempts": attempt - 1}
                 return None
             for plan in self.plans:
                 if plan.get("_skip"):
@@ -190,6 +193,9 @@ class RushFlow:
                                  pay_link=pay_link)
                     logger.info("下单成功: %s -> %s (status=%s)",
                                 plan["name"], order, order_status)
+                    self.last_result = {"result": "success", "order": order,
+                                        "pay_link": pay_link,
+                                        "attempts": attempt}
                     return order
                 except BiliApiError as ex:
                     text = (ex.response_text or "")[:500]
@@ -203,13 +209,17 @@ class RushFlow:
                                      message=str(ex))
                         logger.error(
                             "凭证失效(%s)，重试无意义。请重新抓包更新 "
-                            "config/settings.py 或环境变量 BILI_* 后再战。",
+                            "config/secrets.py 或环境变量 BILI_* 后再战。",
                             ex.code)
+                        self.last_result = {"result": "credential_expired",
+                                            "attempts": attempt}
                         return None
                     if outcome is Outcome.ALREADY_DONE:
                         self._record("stop_reason", reason="already_owned",
                                      message=str(ex))
                         logger.info("已有订单/已购买，停止: %s", ex)
+                        self.last_result = {"result": "already_owned",
+                                            "attempts": attempt}
                         return None
                     if outcome is Outcome.SOLD_OUT:
                         if sold_out_at is None:
@@ -219,6 +229,8 @@ class RushFlow:
                             self._record("stop_reason", reason="sold_out",
                                          message=str(ex))
                             logger.info("已售罄，停止重试")
+                            self.last_result = {"result": "sold_out",
+                                                "attempts": attempt}
                             return None
                     elif outcome is Outcome.SYSTEM_ERROR:
                         syserr_streak += 1
@@ -241,4 +253,5 @@ class RushFlow:
             time.sleep(next_interval(attempt, elapsed, interval))
         self._record("rush_timeout", attempts=attempt)
         logger.warning("坚持 %ss 后仍未抢到", total)
+        self.last_result = {"result": "timeout", "attempts": attempt}
         return None

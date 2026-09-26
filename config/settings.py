@@ -32,6 +32,15 @@ SESSDATA = _cred("BILI_SESSDATA", "SESSDATA")
 DEDE_USER_ID = _cred("BILI_DEDE_USER_ID", "DEDE_USER_ID")
 
 # ----------------------------------------------------------------------------
+# 邮件推送（环境变量或 config/secrets.py；SMTP_HOST/USER/PASS 齐备才启用）
+# ----------------------------------------------------------------------------
+SMTP_HOST = _cred("BILI_SMTP_HOST", "SMTP_HOST")
+SMTP_PORT = int(_cred("BILI_SMTP_PORT", "SMTP_PORT") or 465)
+SMTP_USER = _cred("BILI_SMTP_USER", "SMTP_USER")
+SMTP_PASS = _cred("BILI_SMTP_PASS", "SMTP_PASS")
+NOTIFY_TO = _cred("BILI_NOTIFY_TO", "NOTIFY_TO") or SMTP_USER
+
+# ----------------------------------------------------------------------------
 # App 签名参数（B站安卓客户端公开 appkey/appsec）
 # ----------------------------------------------------------------------------
 APP_KEY = "1d8b6e7d45233436"

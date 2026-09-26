@@ -155,6 +155,27 @@ python tools/dashboard.py            # http://127.0.0.1:8777
 Docker 下仪表盘是独立服务：`docker compose up -d` 后访问
 `http://<宿主机>:8777`。
 
+## 邮件推送
+
+抢购结束自动发邮件：**成功→订单号+支付直达链接（尽快支付）**、
+凭证失效→提醒重新抓包、其余失败→原因+复盘命令。未配置时静默跳过，
+发送失败不影响抢购主流程。
+
+```bash
+# 1) 配置 config/secrets.py（或环境变量 BILI_SMTP_*）：
+SMTP_HOST = "smtp.qq.com"     # 465=SSL；587 端口自动用 STARTTLS
+SMTP_PORT = 465
+SMTP_USER = "you@qq.com"
+SMTP_PASS = "SMTP授权码"       # 邮箱设置里生成，不是登录密码
+NOTIFY_TO = "me@qq.com"        # 留空=发给自己
+
+# 2) 验证配置
+python main.py --test-notify
+```
+
+Docker 下在 compose 的 environment 里加 `BILI_SMTP_HOST/PORT/USER/PASS/
+BILI_NOTIFY_TO` 即可。
+
 ## 目录结构
 
 ```
