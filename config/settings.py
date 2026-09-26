@@ -3,9 +3,17 @@
 
 凭证读取优先级：环境变量 > config/secrets.py（本地私有，不入 git）。
 两者都缺失时凭证为空串，实际请求会收到 -101，分类器会提示更新凭证。
+
+邮件配置额外支持 config/notify.json（仪表盘网页保存生成），
+优先级：环境变量 > notify.json > secrets.py。
 """
 import copy
+import json as _json
 import os
+from pathlib import Path
+
+# 仪表盘保存的邮件配置文件（含授权码，不入 git/镜像）
+NOTIFY_JSON_PATH = Path(__file__).resolve().parent / "notify.json"
 
 try:
     from config import secrets as _secrets
@@ -16,10 +24,29 @@ except ImportError:   # 未创建 secrets.py 时退化为空凭证
         BILI_JCT = ""
         SESSDATA = ""
         DEDE_USER_ID = ""
+        SMTP_HOST = ""
+        SMTP_PORT = 465
+        SMTP_USER = ""
+        SMTP_PASS = ""
+        NOTIFY_TO = ""
 
 
-def _cred(env_name: str, attr: str) -> str:
-    return os.environ.get(env_name) or getattr(_secrets, attr)
+def _notify_json() -> dict:
+    try:
+        return _json.loads(NOTIFY_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _cred(env_name: str, attr: str, json_key: str | None = None) -> str:
+    val = os.environ.get(env_name)
+    if val:
+        return val
+    if json_key:
+        val = _notify_json().get(json_key)
+        if val:
+            return str(val)
+    return getattr(_secrets, attr)
 
 
 # ----------------------------------------------------------------------------
@@ -32,13 +59,13 @@ SESSDATA = _cred("BILI_SESSDATA", "SESSDATA")
 DEDE_USER_ID = _cred("BILI_DEDE_USER_ID", "DEDE_USER_ID")
 
 # ----------------------------------------------------------------------------
-# 邮件推送（环境变量或 config/secrets.py；SMTP_HOST/USER/PASS 齐备才启用）
+# 邮件推送（环境变量 > notify.json（仪表盘）> secrets.py；齐备才启用）
 # ----------------------------------------------------------------------------
-SMTP_HOST = _cred("BILI_SMTP_HOST", "SMTP_HOST")
-SMTP_PORT = int(_cred("BILI_SMTP_PORT", "SMTP_PORT") or 465)
-SMTP_USER = _cred("BILI_SMTP_USER", "SMTP_USER")
-SMTP_PASS = _cred("BILI_SMTP_PASS", "SMTP_PASS")
-NOTIFY_TO = _cred("BILI_NOTIFY_TO", "NOTIFY_TO") or SMTP_USER
+SMTP_HOST = _cred("BILI_SMTP_HOST", "SMTP_HOST", "host")
+SMTP_PORT = int(_cred("BILI_SMTP_PORT", "SMTP_PORT", "port") or 465)
+SMTP_USER = _cred("BILI_SMTP_USER", "SMTP_USER", "user")
+SMTP_PASS = _cred("BILI_SMTP_PASS", "SMTP_PASS", "pass")
+NOTIFY_TO = _cred("BILI_NOTIFY_TO", "NOTIFY_TO", "to") or SMTP_USER
 
 # ----------------------------------------------------------------------------
 # App 签名参数（B站安卓客户端公开 appkey/appsec）

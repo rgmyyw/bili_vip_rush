@@ -11,6 +11,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 config/secrets.py
+config/notify.json
 tests/test_signer_har.py
 README.md
 requirements-dev.txt

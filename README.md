@@ -161,6 +161,11 @@ Docker 下仪表盘是独立服务：`docker compose up -d` 后访问
 凭证失效→提醒重新抓包、其余失败→原因+复盘命令。未配置时静默跳过，
 发送失败不影响抢购主流程。
 
+**方式一：仪表盘网页配置（推荐）**——仪表盘"邮件通知"卡片点"配置"，
+填 SMTP 后保存，可直接点"发送测试邮件"验证。配置保存在
+`config/notify.json`（含授权码，已 gitignore），保存后立即生效。
+
+**方式二：文件/环境变量**：
 ```bash
 # 1) 配置 config/secrets.py（或环境变量 BILI_SMTP_*）：
 SMTP_HOST = "smtp.qq.com"     # 465=SSL；587 端口自动用 STARTTLS
@@ -174,7 +179,8 @@ python main.py --test-notify
 ```
 
 Docker 下在 compose 的 environment 里加 `BILI_SMTP_HOST/PORT/USER/PASS/
-BILI_NOTIFY_TO` 即可。
+BILI_NOTIFY_TO` 即可。三种方式优先级：环境变量 > notify.json（仪表盘）>
+secrets.py。
 
 ## 目录结构
 

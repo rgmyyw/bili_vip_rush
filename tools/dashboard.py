@@ -26,6 +26,11 @@ from core.logstats import (                 # noqa: E402
     list_runs,
     load_rows,
 )
+from core.notify import (                   # noqa: E402
+    notify_config_view,
+    save_notify_config,
+    send_mail,
+)
 from core.run_logger import NullRunLogger   # noqa: E402
 
 LOGS_DIR = ROOT / "logs"
@@ -88,10 +93,35 @@ PAGE = """<!DOCTYPE html>
  .muted{color:var(--dim)} code{background:#222834;padding:1px 5px;border-radius:4px}
  button{background:var(--card);color:var(--fg);border:1px solid var(--line);
    border-radius:8px;padding:6px 14px;cursor:pointer}
+ button:hover{border-color:var(--accent)}
+ input{width:100%;background:#10131a;color:var(--fg);border:1px solid var(--line);
+   border-radius:6px;padding:7px 9px;margin-top:4px;font:inherit}
+ input:focus{outline:none;border-color:var(--accent)}
 </style></head><body>
 <h1>B站联合会员抢购仪表盘 <small id="clock"></small></h1>
 <div class="grid" id="live"></div>
 <h1 style="margin-top:6px">抢购记录 <span class="muted" id="runcount"></span></h1>
+<div class="card" id="notifycard" style="margin-bottom:18px">
+ <div style="display:flex;justify-content:space-between;align-items:center">
+  <div><b>邮件通知</b> <span id="nstate" class="tag done">加载中</span>
+    <span class="muted" id="nsummary" style="margin-left:8px"></span></div>
+  <button onclick="toggleForm()">配置</button>
+ </div>
+ <div id="nform" style="display:none;margin-top:12px">
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+   <div><div class="k">SMTP 服务器</div><input id="f_host" placeholder="smtp.qq.com"></div>
+   <div><div class="k">端口 (465=SSL, 587=STARTTLS)</div><input id="f_port" type="number" value="465"></div>
+   <div><div class="k">发件邮箱</div><input id="f_user" placeholder="you@qq.com"></div>
+   <div><div class="k">SMTP 授权码</div><input id="f_pass" type="password" placeholder=""></div>
+   <div><div class="k">收件邮箱 (留空=发给自己)</div><input id="f_to" placeholder="me@qq.com"></div>
+  </div>
+  <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+   <button onclick="saveCfg()">保存</button>
+   <button onclick="testMail()">发送测试邮件</button>
+   <span id="nmsg" class="muted"></span>
+  </div>
+ </div>
+</div>
 <table id="runs"><thead><tr>
  <th>开始时间</th><th>模式</th><th>结果</th><th>尝试</th><th>HTTP</th><th>耗时</th><th>订单</th>
 </tr></thead><tbody></tbody></table>
@@ -181,9 +211,52 @@ async function showDetail(file){
 }
 function hideDetail(){document.getElementById("detail").style.display="none";}
 
+async function refreshNotify(){
+  const c = await j("/api/notify-config");
+  const st = document.getElementById("nstate");
+  st.textContent = c.enabled ? "已启用" : "未配置";
+  st.className = "tag " + (c.enabled ? "success" : "done");
+  document.getElementById("nsummary").textContent =
+    c.enabled ? `${c.user} → ${c.to} (${c.host}:${c.port}, 授权码${c.pass_set?"已设":"未设"})`
+              : "抢购结束不会发邮件，点击右侧配置";
+  if(document.getElementById("nform").style.display === "block" &&
+     !document.getElementById("f_host").value){
+    document.getElementById("f_host").value = c.host || "";
+    document.getElementById("f_port").value = c.port || 465;
+    document.getElementById("f_user").value = c.user || "";
+    document.getElementById("f_to").value = (c.to === c.user) ? "" : (c.to || "");
+    document.getElementById("f_pass").placeholder =
+      c.pass_set ? "已设置，留空则不修改" : "邮箱设置里生成的授权码";
+  }
+}
+function toggleForm(){
+  const f = document.getElementById("nform");
+  f.style.display = f.style.display === "block" ? "none" : "block";
+  if(f.style.display === "block") refreshNotify();
+}
+async function saveCfg(){
+  const msg = document.getElementById("nmsg");
+  msg.textContent = "保存中...";
+  const r = await fetch("/api/notify-config", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      host: f_host.value.trim(), port: +f_port.value || 465,
+      user: f_user.value.trim(), pass: f_pass.value, to: f_to.value.trim()})});
+  const d = await r.json();
+  msg.textContent = d.error ? d.error : "已保存" + (d.enabled ? "，通知已启用" : "（信息不全，未启用）");
+  f_pass.value = ""; refreshNotify();
+}
+async function testMail(){
+  const msg = document.getElementById("nmsg");
+  msg.textContent = "发送中...";
+  const r = await fetch("/api/notify-test", {method:"POST"});
+  const d = await r.json();
+  msg.textContent = d.ok ? "测试邮件已发送，请查收" : d.error;
+}
+
 setInterval(()=>{document.getElementById("clock").textContent =
   new Date().toLocaleString("zh-CN");}, 1000);
-refreshLive(); refreshRuns();
+refreshLive(); refreshRuns(); refreshNotify();
 setInterval(refreshLive, 5000);
 setInterval(refreshRuns, 10000);
 </script></body></html>"""
@@ -201,6 +274,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self._json({"error": "bad json"}, 400)
+
+        if path == "/api/notify-config":
+            if not isinstance(body, dict):
+                return self._json({"error": "bad body"}, 400)
+            try:
+                return self._json(save_notify_config(body))
+            except Exception as ex:
+                return self._json({"error": f"保存失败: {ex}"[:200]}, 500)
+        if path == "/api/notify-test":
+            ok = send_mail("[B站抢购] 仪表盘测试邮件",
+                           "收到这封邮件说明抢购结果推送配置成功。\n"
+                           "抢购成功后会推送订单号与支付链接。")
+            return self._json({"ok": ok,
+                               "error": "" if ok else "发送失败: 检查授权码/端口/发件人"})
+        return self._json({"error": "not found"}, 404)
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/" or path == "/index.html":
@@ -214,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(refresh_live())
         elif path == "/api/runs":
             self._json(list_runs(LOGS_DIR))
+        elif path == "/api/notify-config":
+            self._json(notify_config_view())
         elif path.startswith("/api/runs/"):
             name = path[len("/api/runs/"):]
             f = (LOGS_DIR / name)

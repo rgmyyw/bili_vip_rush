@@ -4,6 +4,7 @@
 原则：通知永远不能影响抢购主流程——未配置时静默跳过，发送失败只记
 日志事件并返回 False。
 """
+import json
 import logging
 import smtplib
 from datetime import datetime
@@ -27,6 +28,47 @@ REASON_TEXT = {
 
 def notify_enabled() -> bool:
     return bool(settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASS)
+
+
+def notify_config_view() -> dict:
+    """仪表盘用的配置视图：授权码不回传，只返回是否已设置。"""
+    return {
+        "enabled": notify_enabled(),
+        "host": settings.SMTP_HOST,
+        "port": settings.SMTP_PORT,
+        "user": settings.SMTP_USER,
+        "to": settings.NOTIFY_TO,
+        "pass_set": bool(settings.SMTP_PASS),
+    }
+
+
+def save_notify_config(cfg: dict) -> dict:
+    """仪表盘保存邮件配置到 config/notify.json，并让本进程立即生效。
+
+    cfg: {host, port, user, pass, to}；pass 留空表示保留现有授权码。
+    """
+    from config import settings as settings_mod
+
+    host = (cfg.get("host") or "").strip()
+    port = int(cfg.get("port") or 465)
+    user = (cfg.get("user") or "").strip()
+    to = (cfg.get("to") or "").strip()
+    password = (cfg.get("pass") or "").strip()
+    if not password:
+        password = settings.SMTP_PASS   # 留空保留旧授权码
+
+    data = {"host": host, "port": port, "user": user,
+            "pass": password, "to": to}
+    settings.NOTIFY_JSON_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 本进程立即生效（无需重启仪表盘/抢购进程）
+    settings_mod.SMTP_HOST = host
+    settings_mod.SMTP_PORT = port
+    settings_mod.SMTP_USER = user
+    settings_mod.SMTP_PASS = password
+    settings_mod.NOTIFY_TO = to or user
+    return notify_config_view()
 
 
 def send_mail(subject: str, body: str) -> bool:
