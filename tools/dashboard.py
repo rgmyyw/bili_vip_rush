@@ -228,7 +228,8 @@ function liveCards(d){
     <div class="v ${d.ok?"warn":""}">${cnt||"—"}</div>
     <div class="k">${next}</div></div>
   <div class="card"><div class="k">预约</div>
-    <div class="v ${acctOk&&d.data.isReserved?"ok":""}">${acctOk?(d.data.isReserved?"已预约":"未预约"):"—"}</div></div>
+    <div class="v ${acctOk&&d.data.isReserved?"ok":""}">${acctOk?(d.data.isReserved?"已预约":"未预约"):"—"}</div>
+    <div class="k">${acctOk&&!d.data.isReserved?"<button onclick='doReserve()'>一键预约</button>":""}</div></div>
   <div class="card"><div class="k">已购买</div>
     <div class="v ${acctOk&&d.data.has_buy?"ok":""}">${acctOk?(d.data.has_buy?"是":"否"):"—"}</div></div>
   <div class="card"><div class="k">凭证</div>
@@ -377,6 +378,12 @@ async function saveCred(){
   refreshCred();
 }
 function pickHar(){ document.getElementById("harfile").click(); }
+async function doReserve(){
+  if(!confirm("确认提交明日场次预约?")) return;
+  const d = await j2("/api/reserve", "POST", {});
+  alert(d.ok ? "预约请求已提交,请看预约卡片确认状态(接口 -400 时以卡片实际状态为准)" : "预约失败: " + d.error);
+  refreshLive();
+}
 async function uploadHar(input){
   const f = input.files && input.files[0];
   input.value = "";
@@ -468,6 +475,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(out)
             except Exception as ex:
                 return self._json({"error": f"保存失败: {ex}"[:200]}, 500)
+        if path == "/api/reserve":
+            # 一键预约(手动触发):reserve 按场次有效,-400 等业务态
+            # 响应原样返回,由前端结合 isReserved 复核展示
+            from core.auth import reload_credentials_into_settings
+            from core.client import BiliClient
+            from core.run_logger import NullRunLogger
+            reload_credentials_into_settings()
+            client = BiliClient(run_logger=NullRunLogger(), timeout=10)
+            client.phase = "reserve"
+            try:
+                result = client.reserve()
+                _cred.update(state="")   # 状态可能变化,清体检缓存
+                return self._json({"ok": True, "result": str(result)[:300]})
+            except Exception as ex:
+                return self._json({"ok": False, "error": str(ex)[:200]})
         if path == "/api/cred-check":
             # 立即强制体检(绕过缓存),供"验证"按钮与外部探测
             from core.credwatch import check_once
