@@ -104,6 +104,18 @@ def run_one_cycle(mode: str, args) -> int:
             logs.log_event("reserve_ok", result=result)
         else:
             flow = RushFlow(client, run_logger=logs)
+            # 每天自动尽力预约(用户 09-30 要求):场次重置后补约;预约
+            # 形态已对齐 App(code=0);业务态失败(-400 已约/未开)忽略,
+            # 不阻塞抢购、不发失败邮件
+            try:
+                client.phase = "reserve"
+                result = client.reserve()
+                logging.info("自动预约成功: %s", result)
+                logs.log_event("reserve_auto_ok", result=str(result)[:200])
+            except Exception as ex:
+                logging.info("自动预约未成功(忽略,不影响抢购): %s",
+                             str(ex)[:150])
+                logs.log_event("reserve_auto_skip", error=str(ex)[:150])
             flow.precheck()   # 抢前自检：状态/资格一眼可见
             order = flow.rush(target_ts=run_target_ts(args))
             if order:
