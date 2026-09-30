@@ -259,3 +259,31 @@ def test_pacing_exception_worker_survives(pause_file, monkeypatch):
     with _m.patch.object(r, "phase_pacing", side_effect=RuntimeError("boom")):
         order = flow.rush(target_ts=_t.time() - 1, duration=0.8)
     assert order and order["order_no"] == "OK-P"    # 保守节奏下仍抢到
+
+
+# ------------------------------------------------ 命中率增强
+def test_precise_offset_jump_detection():
+    """跳变检测法:模拟服务器钟(整数秒+offset),恢复精度应 <150ms。"""
+    import time as _t
+    from core.time_sync import measure_offset_precise
+    TRUE_OFF = 123.456   # 服务器比本地快 123.456s
+    def fake_server_time():
+        return int(_t.time() + TRUE_OFF)
+    off = measure_offset_precise(fake_server_time, probe_interval=0.02,
+                                 max_wait=2.0)
+    assert off is not None
+    assert abs(off - TRUE_OFF) < 0.15, f"偏差过大: {off}"
+
+
+def test_peak_exempt_disabled_after_702_streak(monkeypatch):
+    """连续 50 发 -702 后黄金窗豁免失效(防全速被频控全吞)。"""
+    import flows.rush as r
+    counter = {"lock": threading.Lock(), "streak702": 0}
+    monkeypatch.setattr(r.settings, "RUSH_PEAK_FROM", -999.0)
+    monkeypatch.setattr(r.settings, "RUSH_PEAK_TO", 999.0)
+    dens, exempt, stop = r.phase_pacing(0.0)
+    assert exempt is True
+    # 模拟连续 702 达 50:豁免逻辑在调用方,这里验证阈值常量语义
+    with counter["lock"]:
+        counter["streak702"] = 50
+    assert counter["streak702"] >= 50

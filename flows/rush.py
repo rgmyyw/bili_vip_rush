@@ -168,13 +168,21 @@ class RushFlow:
         card = self.client.get_attract_card()
         if target_ts is None:
             target_ts = float(card["next_open_at"])
-        # 校时:B 站接口为准(目标时钟),NTP 毫秒级交叉验证——
-        # B 站 current_time 是秒级整数,采样可能被网络抖动污染;
-        # 与 NTP 偏差过大时重采样一次,取更接近 NTP 的一组
-        from core.time_sync import measure_ntp_offset
+        # 校时(三级):整秒跳变检测(±50ms) > 中位数法(±500ms 量化误差),
+        # NTP 毫秒级交叉验证防污染
+        from core.time_sync import measure_ntp_offset, measure_offset_precise
         ntp_off = measure_ntp_offset()
-        offset = measure_offset(self.client.get_server_time,
-                                samples=settings.TIME_SYNC_SAMPLES)
+        offset = None
+        try:
+            offset = measure_offset_precise(self.client.get_server_time)
+            if offset is not None:
+                self._record("calibrate_precise", offset_s=round(offset, 4))
+                logger.info("精确校时(跳变检测) %+0.4fs", offset)
+        except Exception:
+            logger.exception("精确校时失败,退回中位数法")
+        if offset is None:
+            offset = measure_offset(self.client.get_server_time,
+                                    samples=settings.TIME_SYNC_SAMPLES)
         if ntp_off is not None and abs(offset - ntp_off) > 0.5:
             logger.warning("B站校时 %+0.3fs 与 NTP %+0.3fs 偏差大,重采样",
                            offset, ntp_off)
@@ -437,11 +445,15 @@ class RushFlow:
                                               "attempts": attempt})
                             stop_event.set()
                             return None
-                    # -702 频控窗口统计(自适应节流依据)
+                    # -702 频控窗口统计(自适应节流依据)+连续计数
+                    # (连续被拒达阈值后黄金窗豁免失效,防全速被频控全吞)
                     with counter["lock"]:
                         counter["win_total"] += 1
                         if ex.code == -702:
                             counter["win_702"] += 1
+                            counter["streak702"] = counter.get("streak702", 0) + 1
+                        else:
+                            counter["streak702"] = 0
                     outcome = classify_error(ex)
                     if outcome is Outcome.CREDENTIAL_EXPIRED:
                         self._record("stop_reason",
@@ -499,6 +511,12 @@ class RushFlow:
             try:
                 sale_s = elapsed - getattr(self, "_lead_s", 0.0)  # 距开售
                 dens, exempt, stop_now = phase_pacing(sale_s)
+                # 频控硬上限:连续 50 发 -702 后黄金窗豁免失效
+                # (开售若不放行频控,全速=全拒=零命中,恢复节流贴线)
+                if exempt:
+                    with counter["lock"]:
+                        if counter.get("streak702", 0) >= 50:
+                            exempt = False
             except Exception:
                 logger.exception("节奏计算异常,保守节奏继续")
                 self._record("pacing_fallback", worker=worker_id)

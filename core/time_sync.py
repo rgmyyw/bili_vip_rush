@@ -58,3 +58,28 @@ def measure_ntp_offset(servers=NTP_SERVERS, timeout: float = 2.0) -> float | Non
     if not offsets:
         return None
     return statistics.median(sorted(offsets))
+
+
+def measure_offset_precise(get_server_time, probe_interval: float = 0.1,
+                           max_wait: float = 2.5) -> float | None:
+    """亚秒级校时：探测 server_ts 整秒跳变瞬间。
+
+    B 站 current_time 为整数秒，中位数法存在固有量化误差(可达 ±500ms)。
+    本方法以 ~100ms 间隔轻探测，捕获 server_ts N→N+1 的翻转时刻：
+    该瞬间服务器钟恰为 N+1.000，本地时刻即跳变观测点，精度 ≈ 探测
+    间隔的一半(±50ms)。平均 0.5s 内即可捕获(约 5~8 发轻请求)，
+    失败返回 None(调用方退回中位数法)。
+    """
+    prev = get_server_time()
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < max_wait:
+        time.sleep(probe_interval)
+        t_a = time.time()
+        cur = get_server_time()
+        t_b = time.time()
+        if cur > prev:
+            # cur>prev 说明整秒跳变发生于两次探测之间,此刻服务器钟
+            # 恰为 cur.0x;以本请求中点近似服务器时刻(消除 RTT/2 偏差)
+            return float(cur) - (t_a + t_b) / 2
+        prev = cur
+    return None
