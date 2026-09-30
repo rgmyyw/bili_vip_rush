@@ -92,7 +92,7 @@ DINGTALK_SECRET = _cred("BILI_DINGTALK_SECRET", "DINGTALK_SECRET",
 # ----------------------------------------------------------------------------
 APP_KEY = "1d8b6e7d45233436"
 APP_SEC = "560c52ccd288fed045859ed18bffd973"
-BUILD = "9110400"
+BUILD = "9110400"   # 09-27 实战抢成功的组合,抢购链路参数冻结不动
 MOBI_APP = "android"
 PLATFORM = "android"
 APP_UA = (
@@ -110,7 +110,11 @@ API_BASE = "https://api.bilibili.com"
 # 有效返回 0）。attract_card 匿名也返回 0，不能用作体检。
 URL_MY_INFO = "https://app.bilibili.com/x/v2/account/myinfo"
 URL_ATTRACT_CARD = f"{API_BASE}/x/vip/activity/sale/summer2026/attract_card"
+# 预约:App 实测(HTTP/2 authority=api 网关)形态——api 域 + 不签名 +
+# JSON body + 活动页 H5 头(app-key/native_api_from/referer 等);big 域
+# 从外部直连 404,App 实际也走 api 网关
 URL_RESERVE = f"{API_BASE}/x/vip/activity/sale/summer2026/reserve"
+RESERVE_BUILD = "9130500"   # App 实测 build;仅预约用,抢购 BUILD 冻结
 URL_BUY_COMPONENT = f"{API_BASE}/pgc/activity/dokodemoDoor/getEasy/moe2026_buyComponentEvo_info"
 URL_CREATE_ORDER = f"{API_BASE}/x/vip/order/create/activity"
 URL_ORDER_STATUS = f"{API_BASE}/x/vip/order/status"

@@ -130,12 +130,35 @@ class BiliClient:
         return int(self.get_attract_card()["current_time"])
 
     def reserve(self) -> dict:
-        """一键预约（写操作）。data 里 csrf 必带。"""
+        """一键预约(App 抓包实测形态:big 域,query 不签名,body JSON)。
+
+        09-30 实证:App 内预约成功请求为 query build/mobi_app/platform/
+        channel/csrf + JSON body {activity_code, ts};旧表单+签名形态
+        在该接口恒 -400。
+        """
+        import time as _time
+        # App 活动页 H5 形态(App-key/native_api_from/referer 为网关路由
+        # 必需;缺 these 头在 api 域返回 -400/404)
+        self.session.headers.update({
+            "app-key": "android64",
+            "native_api_from": "h5",
+            "env": "prod",
+            "referer": "https://www.bilibili.com/blackboard/era/"
+                       "rZPKSDqrJEOrtkVi.html?navhide=1&msource=",
+            "x-bili-redirect": "1",
+        })
         return self._request(
             "POST", settings.URL_RESERVE,
-            data={
-                "activity_code": "summer2026",
+            bare_query={
+                "build": getattr(settings, "RESERVE_BUILD", "9130500"),
+                "mobi_app": settings.MOBI_APP,
+                "platform": settings.PLATFORM,
+                "channel": "xiaomi_cn_tv.danmaku.bili_20210930",
                 "csrf": settings.CSRF,
+            },
+            json_body={
+                "activity_code": "summer2026",
+                "ts": int(_time.time()),
             })
 
     def get_buy_component(self) -> dict:

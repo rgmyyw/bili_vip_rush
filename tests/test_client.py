@@ -125,3 +125,24 @@ def test_check_login_network_error_unknown():
     with mock.patch.object(c.session, "request",
                            side_effect=_requests.RequestException("boom")):
         assert c.check_login() is None
+
+
+def test_reserve_matches_app_capture(monkeypatch):
+    """预约对齐 App 抓包形态:big 域、不签名 bare_query、JSON body。"""
+    from config import settings as st
+    monkeypatch.setattr(st, "CSRF", "fakecsrf123", raising=False)
+    c = make_client()
+    payload = {"code": 0, "message": "OK", "data": {"isReserved": True}}
+    with mock.patch.object(
+            c.session, "request", return_value=FakeResponse(payload)) as req:
+        c.reserve()
+    kwargs = req.call_args.kwargs
+    # App 实测(HTTP/2 authority=api 网关):api 域+H5 头+不签名+JSON body
+    assert "api.bilibili.com" in req.call_args.args[1]
+    q = kwargs["params"]
+    assert "sign" not in q and "access_key" not in q   # 不签名
+    assert q["csrf"] and q["build"] and q["mobi_app"]
+    assert kwargs["json"] == {"activity_code": "summer2026",
+                              "ts": kwargs["json"]["ts"]}
+    for h in ("app-key", "native_api_from", "referer"):
+        assert h in c.session.headers   # 网关路由必需头已带
