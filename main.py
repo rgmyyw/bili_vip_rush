@@ -130,8 +130,11 @@ def run_one_cycle(mode: str, args) -> int:
             else:
                 print("本轮未抢到。复盘: python tools/replay.py")
                 exit_code = 1
-            # 邮件推送（未配置则静默跳过；成功邮件含支付链接）
-            if notify_enabled() and flow.last_result:
+            # 结果推送(邮件+钉钉双通道,任一配置即发;成功含支付链接)
+            from config import settings as _st
+            has_channel = (notify_enabled()
+                           or (_st.DINGTALK_WEBHOOK or "").strip())
+            if has_channel and flow.last_result:
                 flow.last_result["log_file"] = logs.path.name
                 sent = notify_rush_result(flow.last_result)
                 logs.log_event("notify", sent=sent,
