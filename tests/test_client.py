@@ -144,5 +144,11 @@ def test_reserve_matches_app_capture(monkeypatch):
     assert q["csrf"] and q["build"] and q["mobi_app"]
     assert kwargs["json"] == {"activity_code": "summer2026",
                               "ts": kwargs["json"]["ts"]}
+    hdrs = kwargs["headers"]
     for h in ("app-key", "native_api_from", "referer"):
-        assert h in c.session.headers   # 网关路由必需头已带
+        assert hdrs.get(h)   # 网关路由必需头已带(请求级)
+    # 隔离铁律:reserve 专属头绝不残留 session(防泄入下单请求
+    # 改变抢购形态);Referer 须保持构造时的活动页原值(未被 H5 版覆盖)
+    for h in ("app-key", "native_api_from", "env", "x-bili-redirect"):
+        assert h not in c.session.headers
+    assert "navhide" not in c.session.headers.get("Referer", "")

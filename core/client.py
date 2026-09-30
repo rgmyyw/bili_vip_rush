@@ -49,7 +49,8 @@ class BiliClient:
     # ------------------------------------------------------------------ util
     def _request(self, method: str, url: str, extra_params: dict | None = None,
                  data: dict | None = None, json_body: dict | None = None,
-                 bare_query: dict | None = None) -> dict:
+                 bare_query: dict | None = None,
+                 extra_headers: dict | None = None) -> dict:
         """发请求并解析 envelope。返回 dict；code != 0 抛 BiliApiError。
 
         默认走 App 签名参数；传 bare_query 则按原样作为 query（部分
@@ -66,6 +67,8 @@ class BiliClient:
         headers = {"Cookie": settings.build_cookie_header()}
         if json_body is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
+        if extra_headers:   # 请求级临时头(如预约的 H5 头),不污染 session
+            headers.update(extra_headers)
 
         t0 = time.monotonic()
         resp = None
@@ -137,16 +140,17 @@ class BiliClient:
         在该接口恒 -400。
         """
         import time as _time
-        # App 活动页 H5 形态(App-key/native_api_from/referer 为网关路由
-        # 必需;缺 these 头在 api 域返回 -400/404)
-        self.session.headers.update({
+        # App 活动页 H5 形态头(app-key/native_api_from/referer 为网关
+        # 路由必需;缺这些头在 api 域返回 -400)。请求级传递,绝不污染
+        # session——防止这些头泄入后续下单请求改变抢购形态
+        h5_headers = {
             "app-key": "android64",
             "native_api_from": "h5",
             "env": "prod",
             "referer": "https://www.bilibili.com/blackboard/era/"
                        "rZPKSDqrJEOrtkVi.html?navhide=1&msource=",
             "x-bili-redirect": "1",
-        })
+        }
         return self._request(
             "POST", settings.URL_RESERVE,
             bare_query={
@@ -159,7 +163,8 @@ class BiliClient:
             json_body={
                 "activity_code": "summer2026",
                 "ts": int(_time.time()),
-            })
+            },
+            extra_headers=h5_headers)
 
     def get_buy_component(self) -> dict:
         """买赠组件信息：buySets（目标套餐 token 的 hasBuy 资格）。
