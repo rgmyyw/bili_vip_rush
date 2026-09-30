@@ -89,3 +89,39 @@ def test_get_order_status_queries_order_no():
     params = req.call_args.kwargs["params"]
     assert params["order_no"] == "ON9"
     assert params["app_id"] == "241"
+
+
+# ------------------------------------------------------------------ 凭证体检
+def test_check_login_valid():
+    c = make_client()
+    payload = {"code": 0, "message": "0", "data": {"mid": 123}}
+    with mock.patch.object(c.session, "request",
+                           return_value=FakeResponse(payload)):
+        assert c.check_login() is True
+
+
+@pytest.mark.parametrize("code", [-101, -400, 61000])
+def test_check_login_invalid(code):
+    """接口业务码（未登录/请求错误/凭证缺失）判为凭证失效。"""
+    c = make_client()
+    payload = {"code": code, "message": "err"}
+    with mock.patch.object(c.session, "request",
+                           return_value=FakeResponse(payload)):
+        assert c.check_login() is False
+
+
+def test_check_login_http_layer_unknown():
+    """HTTP 层错误（412 风控等）不能断定凭证失效。"""
+    c = make_client()
+    payload = {"code": 0}
+    with mock.patch.object(c.session, "request",
+                           return_value=FakeResponse(payload, status_code=412)):
+        assert c.check_login() is None
+
+
+def test_check_login_network_error_unknown():
+    import requests as _requests
+    c = make_client()
+    with mock.patch.object(c.session, "request",
+                           side_effect=_requests.RequestException("boom")):
+        assert c.check_login() is None

@@ -32,3 +32,29 @@ def server_now(offset: float) -> float:
 def seconds_until(target_server_ts: float, offset: float) -> float:
     """距离服务器目标时间还剩多少秒（可为负）。"""
     return target_server_ts - server_now(offset)
+
+
+# ---------------------------------------------------------------- NTP 校准
+NTP_SERVERS = ("ntp.aliyun.com", "ntp1.aliyun.com", "cn.pool.ntp.org",
+               "time.windows.com")
+
+
+def measure_ntp_offset(servers=NTP_SERVERS, timeout: float = 2.0) -> float | None:
+    """查多个 NTP 服务器,返回 (NTP时间 - 本地时间) 偏移中位数(秒)。
+
+    毫秒级精度,用于交叉验证 B 站接口校时(current_time 为秒级整数,
+    采样可能被网络抖动污染)。全部失败返回 None(不阻塞,仅降级)。
+    """
+    import ntplib as _ntp
+
+    offsets = []
+    for host in servers:
+        try:
+            c = _ntp.NTPClient()
+            resp = c.request(host, version=3, timeout=timeout)
+            offsets.append(resp.offset)
+        except Exception:
+            continue
+    if not offsets:
+        return None
+    return statistics.median(sorted(offsets))

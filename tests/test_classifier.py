@@ -46,3 +46,20 @@ def test_priority_credential_over_soldout():
     # 凭证失效优先级最高（即使是"未登录+售罄"字样混合）
     ex = BiliApiError("code=-101 message=未登录且今日售罄", code=-101)
     assert classify_error(ex) is Outcome.CREDENTIAL_EXPIRED
+
+
+def test_bilibili_business_codes_retry():
+    """B 站六位数业务码(未开售/售罄态返回)必须 RETRY,不能因 >=500 误判。
+
+    09-30 演练实证:69422(暂时无法购买)被旧规则误判 SYSTEM_ERROR,
+    每 5 发冷却 2s,90 秒仅打出 172 发,拖垮开售节奏。
+    """
+    assert classify_error(E(69422, "暂时无法购买此商品")) is Outcome.RETRY
+    assert classify_error(E(43055, "活动状态")) is Outcome.RETRY
+    assert classify_error(E(-702, "请求过于频繁")) is Outcome.RETRY
+
+
+def test_http_codes_split():
+    assert classify_error(E(500, "HTTP 500")) is Outcome.SYSTEM_ERROR
+    assert classify_error(E(503, "HTTP 503")) is Outcome.SYSTEM_ERROR
+    assert classify_error(E(412, "HTTP 412")) is Outcome.SYSTEM_ERROR

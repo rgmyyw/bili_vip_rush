@@ -139,9 +139,10 @@ class BiliClient:
             })
 
     def get_buy_component(self) -> dict:
-        """买赠组件信息：buySets（各套餐 token 的 hasBuy 资格）。
+        """买赠组件信息：buySets（目标套餐 token 的 hasBuy 资格）。
 
         与 App 抓包一致：POST JSON、query 不签名（仅 build/mobi_app 等）。
+        只查询目标套餐（买1年得5年）的资格——其他套餐一律不查不买。
         """
         import time as _time
         return self._request(
@@ -159,9 +160,8 @@ class BiliClient:
                     "buyId": "moe2026",
                     "pageCode": "sub",
                     "skus": [
-                        {"actToken": "423662449920260824193209", "type": "vip"},
-                        {"actToken": "506792554720260824193255", "type": "vip"},
-                        {"actToken": "987488888720260824193333", "type": "tv"},
+                        {"actToken": settings.TARGET_PLANS[0]["act_token"],
+                         "type": "tv"},
                     ],
                     "shareNo": None,
                 },
@@ -217,16 +217,54 @@ class BiliClient:
         return ""
 
     # ------------------------------------------------------------------ misc
-    def prewarm(self) -> bool:
+    def check_login(self) -> bool | None:
+        """凭证体检：App 端账号接口验证登录态（attract_card 匿名也返回 0，
+        不能区分凭证有效性，必须用需要登录的 myinfo）。
+
+        返回 True=有效 / False=凭证失效 / None=网络或风控层异常，无法判定。
+        """
+        self.phase = "credcheck"
+        try:
+            self._request("GET", settings.URL_MY_INFO)
+        except BiliApiError as ex:
+            # 接口业务码为负（-101/-400）或 61000 这类大码 → 凭证问题；
+            # 100~599 是 HTTP 层错误（412 风控等），code=None 是网络失败，
+            # 这两种不能断定凭证失效
+            if ex.code is not None and (ex.code < 0 or ex.code >= 1000):
+                return False
+            return None
+        return True
+
+    def prewarm(self, connections: int = 1) -> float | None:
         """开抢前预热连接：提前完成 DNS + TCP + TLS，进 Session 连接池。
 
-        失败无所谓（预热失败不影响正式请求）。
+        connections>1 时并发预热多条连接（填池，防单连接偶发握手失败
+        耽误第一发）。返回最慢一次成功预热的耗时（秒），全失败返回
+        None；耗时供抢购层自适应第一发提前量。预热失败不影响正式请求。
         """
-        try:
-            self.session.head(settings.API_BASE + "/", timeout=2)
-            return True
-        except Exception:
-            return False
+        n = max(1, int(connections))
+        results: list = [None] * n
+
+        def _one(i: int):
+            t0 = time.monotonic()
+            try:
+                self.session.head(settings.API_BASE + "/", timeout=2)
+                results[i] = time.monotonic() - t0
+            except Exception:
+                pass
+
+        if n == 1:
+            _one(0)
+        else:
+            import threading
+            threads = [threading.Thread(target=_one, args=(i,))
+                       for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        vals = [v for v in results if v is not None]
+        return max(vals) if vals else None
 
     def pay_link(self, plan: dict) -> str:
         """H5 收银台链接（下单成功后手动打开支付）。"""

@@ -23,8 +23,9 @@ from pathlib import Path
 
 from core.client import BiliClient
 from core.notify import notify_enabled, notify_rush_result
+from core.pause import RushPausedError, is_paused, pause_state
 from core.run_logger import RunLogger
-from flows.rush import RushFlow
+from flows.rush import PlanValidationError, RushFlow
 
 LOGS_DIR = Path(__file__).resolve().parent / "logs"
 
@@ -110,11 +111,10 @@ def run_one_cycle(mode: str, args) -> int:
                 print("抢购成功！订单信息：")
                 print(order)
                 print("=" * 60)
-                for plan in flow.plans:
-                    if plan["name"] == "178超级大会员(买1年得5年, 连续包年)":
-                        print("支付链接(手机打开):")
-                        print(client.pay_link(plan))
-                        break
+                # 支付链接用目标套餐生成（白名单保证 plans[0] 即唯一
+                # 可购套餐，不按名字匹配，防改名错配）
+                print("支付链接(手机打开):")
+                print(client.pay_link(flow.plans[0]))
             else:
                 print("本轮未抢到。复盘: python tools/replay.py")
                 exit_code = 1
@@ -128,6 +128,16 @@ def run_one_cycle(mode: str, args) -> int:
         logs.log_meta(event="run_interrupted", reason="KeyboardInterrupt")
         print("\n手动中断，日志已保存")
         exit_code = 130
+    except PlanValidationError as ex:   # 白名单自检拦截:已双通道告警,不再发 crashed
+        logs.log_meta(event="plan_validation_blocked", reason=str(ex))
+        print(f"\n本轮已拦截: {ex}")
+        logging.error("套餐白名单自检未通过: %s", ex)
+        return 2
+    except RushPausedError as ex:   # 暂停中止：非失败，不发邮件
+        logs.log_meta(event="paused_abort", reason=str(ex))
+        print(f"\n本轮已中止：服务处于暂停状态（{ex}）")
+        logging.warning("本轮因服务暂停中止: %s", ex)
+        return 0
     except Exception as ex:  # 兜底：任何未预期异常都要留现场
         import traceback
         logs.log_meta(event="run_crashed", error=repr(ex),
@@ -151,16 +161,25 @@ def main():
         # 常驻调度：每天 daemon 时刻启动一轮（抢购目标以服务器
         # next_open_at 为准，daemon 时刻只是"起跑线"，提前量放余量）
         logging.info("常驻模式启动，每天 %s 自动执行", args.daemon)
+        from core.credwatch import start_cred_watch
+        start_cred_watch()   # 凭证巡检:每小时体检,失效邮件+钉钉告警
         while True:
             target = next_run_ts(args.daemon)
-            logging.info("下一轮触发: %s",
+            logging.info("下一轮触发: %s%s",
                          datetime.fromtimestamp(target).strftime(
-                             "%Y-%m-%d %H:%M:%S"))
+                             "%Y-%m-%d %H:%M:%S"),
+                         "（服务已暂停，到点将跳过）" if is_paused() else "")
             while True:
                 remain = target - time.time()
                 if remain <= 0:
                     break
                 time.sleep(min(remain, 3600.0))   # 分段睡，抗时钟跳变
+            if is_paused():
+                st = pause_state()
+                logging.warning("服务已暂停(%s)，跳过本轮起跑",
+                                st.get("reason") or "未注明原因")
+                time.sleep(300)   # 暂停态下 5 分钟后再看（恢复后等下个周期）
+                continue
             try:
                 run_one_cycle("daemon", args)
             except KeyboardInterrupt:

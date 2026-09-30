@@ -44,6 +44,14 @@ def classify_error(ex) -> Outcome:
         return Outcome.ALREADY_DONE
     if any(w in msg for w in SOLD_OUT_WORDS):
         return Outcome.SOLD_OUT
-    if code is None or code >= 500:
-        return Outcome.SYSTEM_ERROR
+    # HTTP 层错误(网络失败/非 JSON/4xx/5xx)按系统错误;注意 code 同时
+    # 承载 B 站业务码(负数或 69422/43055 这类六位数),不能用 >=500 一刀切
+    # ——否则"暂时无法购买此商品"(69422,未开售/售罄态正常返回)会被
+    # 误判成系统错误触发冷却,拖垮开售瞬间节奏(09-30 演练实证)
+    if code is None:
+        return Outcome.SYSTEM_ERROR          # 网络失败/非 JSON
+    if isinstance(code, int) and 100 <= code <= 599:
+        # HTTP 层:429=频控按上游语义继续重试;其余 4xx/5xx 按系统错误
+        # (412/403 已被抢购层风控熔断前置处理)
+        return Outcome.RETRY if code == 429 else Outcome.SYSTEM_ERROR
     return Outcome.RETRY

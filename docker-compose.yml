@@ -9,38 +9,52 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-      # 凭证注入：镜像不含任何凭证（secrets.py 被 .dockerignore 排除），
-      # 必须通过环境变量传入，或挂载本地 config/secrets.py：
-      # - BILI_ACCESS_KEY=xxx
-      # - BILI_CSRF=xxx
-      # - BILI_SESSDATA=xxx
-      # - BILI_BILI_JCT=xxx
-      # - BILI_DEDE_USER_ID=xxx
-      # 邮件推送（选配，齐备才启用）：
-      # - BILI_SMTP_HOST=smtp.qq.com
-      # - BILI_SMTP_PORT=465
-      # - BILI_SMTP_USER=you@qq.com
-      # - BILI_SMTP_PASS=授权码
-      # - BILI_NOTIFY_TO=me@qq.com
+      # 凭证从同目录 .env 插值注入（.env 不入 git/镜像），镜像不含任何明文：
+      - BILI_ACCESS_KEY=${BILI_ACCESS_KEY:-}
+      - BILI_CSRF=${BILI_CSRF:-}
+      - BILI_SESSDATA=${BILI_SESSDATA:-}
+      - BILI_BILI_JCT=${BILI_BILI_JCT:-}
+      - BILI_DEDE_USER_ID=${BILI_DEDE_USER_ID:-}
+      # 邮件推送（选配，齐备才启用），同样走 .env：
+      - BILI_SMTP_HOST=${BILI_SMTP_HOST:-}
+      - BILI_SMTP_PORT=${BILI_SMTP_PORT:-}
+      - BILI_SMTP_USER=${BILI_SMTP_USER:-}
+      - BILI_SMTP_PASS=${BILI_SMTP_PASS:-}
+      - BILI_NOTIFY_TO=${BILI_NOTIFY_TO:-}
     volumes:
       - ./logs:/app/logs
       # 仪表盘保存的邮件配置与登录凭证（扫码更新），两个服务共用：
       - ./config/notify.json:/app/config/notify.json
       - ./config/credentials.json:/app/config/credentials.json
+      - ./config/pause.json:/app/config/pause.json
+    mem_limit: 256m
 
   # 仪表盘：http://127.0.0.1:8777 （实时状态/抢购记录/调用明细/邮件配置）
   bili-dashboard:
     image: bili-vip-rush:latest
     container_name: bili-dashboard
-    command: ["python", "tools/dashboard.py", "--host", "0.0.0.0", "--port", "8777"]
+    # 镜像 ENTRYPOINT 是 python main.py，仪表盘须整段覆盖 entrypoint，
+    # 否则 command 会被拼成 main.py 的参数
+    entrypoint: ["python", "tools/dashboard.py"]
+    command: ["--host", "0.0.0.0", "--port", "8777"]
     restart: unless-stopped
     ports:
       - "8777:8777"
     environment:
       - TZ=Asia/Shanghai
-      # 凭证注入同上（BILI_ACCESS_KEY 等），与抢购服务保持一致
+      # 凭证注入同 bili-rush（.env 插值），与抢购服务保持一致
+      - BILI_ACCESS_KEY=${BILI_ACCESS_KEY:-}
+      - BILI_CSRF=${BILI_CSRF:-}
+      - BILI_SESSDATA=${BILI_SESSDATA:-}
+      - BILI_BILI_JCT=${BILI_BILI_JCT:-}
+      - BILI_DEDE_USER_ID=${BILI_DEDE_USER_ID:-}
     volumes:
       - ./logs:/app/logs
+      # 凭证也挂给仪表盘：保存凭证/扫码登录由本服务写入，不挂载会丢
+      - ./config/notify.json:/app/config/notify.json
+      - ./config/credentials.json:/app/config/credentials.json
+      - ./config/pause.json:/app/config/pause.json
+    mem_limit: 256m
 
 # 常用操作：
 #   docker compose build

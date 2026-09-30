@@ -1,2 +1,2 @@
 requests>=2.28
-qrcode>=7.0
+ntplib>=0.4

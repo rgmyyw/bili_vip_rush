@@ -42,8 +42,8 @@ def make_flow(order_outcomes, tmp_path, **rush_kwargs):
     client = FakeClient(order_outcomes)
     flow = RushFlow(client, plans=[{
         "name": "p1", "act_token": "T1", "app_id": "241",
-        "app_sub_id": "26moe_fhc", "panel_type": "P", "months": 12,
-        "order_type": 1, "product_type": "1"}],
+        "app_sub_id": "26moe_fhc", "panel_type": "26moe_cdd178",
+        "months": 12, "order_type": 1, "product_type": "1"}],
         log_dir=tmp_path)
     return flow, client
 

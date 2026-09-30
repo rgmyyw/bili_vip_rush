@@ -112,7 +112,7 @@ def test_rush_sets_last_result(tmp_path):
     # 成功路径
     flow = RushFlow(FakeClient([{"order_no": "O1"}]), plans=[{
         "name": "p", "act_token": "T", "app_id": "241", "app_sub_id": "s",
-        "panel_type": "P", "months": 12, "order_type": 1,
+        "panel_type": "26moe_cdd178", "months": 12, "order_type": 1,
         "product_type": "1"}], log_dir=tmp_path)
     flow.rush(target_ts=_t.time() - 1, early_seconds=0, interval=0, duration=5)
     assert flow.last_result["result"] == "success"
@@ -122,8 +122,34 @@ def test_rush_sets_last_result(tmp_path):
     flow2 = RushFlow(FakeClient(
         [BiliApiError("code=-101 message=账号未登录", code=-101)]), plans=[{
         "name": "p", "act_token": "T", "app_id": "241", "app_sub_id": "s",
-        "panel_type": "P", "months": 12, "order_type": 1,
+        "panel_type": "26moe_cdd178", "months": 12, "order_type": 1,
         "product_type": "1"}], log_dir=tmp_path)
     flow2.rush(target_ts=_t.time() - 1, early_seconds=0, interval=0,
                duration=5)
     assert flow2.last_result["result"] == "credential_expired"
+
+
+def test_notify_rush_result_dual_channel(monkeypatch):
+    """抢购结果通知邮件+钉钉双通道(钉钉即达,支付时效关键)。"""
+    from core import notify
+    calls = {"mail": 0, "ding": 0}
+    monkeypatch.setattr(notify, "notify_enabled", lambda: True)
+    monkeypatch.setattr(notify, "send_mail",
+                        lambda s, b: calls.__setitem__("mail", calls["mail"]+1) or True)
+    monkeypatch.setattr(notify, "send_dingtalk",
+                        lambda t: calls.__setitem__("ding", calls["ding"]+1) or True)
+    ok = notify.notify_rush_result(
+        {"result": "risk_control", "attempts": 10, "log_file": "x.jsonl"})
+    assert ok is True
+    assert calls == {"mail": 1, "ding": 1}   # 双通道各一次
+
+
+def test_notify_rush_result_risk_control_text(monkeypatch):
+    from core import notify
+    subjects = []
+    monkeypatch.setattr(notify, "notify_enabled", lambda: True)
+    monkeypatch.setattr(notify, "send_mail",
+                        lambda s, b: subjects.append(s) or True)
+    monkeypatch.setattr(notify, "send_dingtalk", lambda t: True)
+    notify.notify_rush_result({"result": "risk_control", "attempts": 5})
+    assert "风控" in subjects[0]   # 中文文案而非裸英文码

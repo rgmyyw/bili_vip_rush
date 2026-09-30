@@ -9,6 +9,7 @@
 import json
 import logging
 import random
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,10 +28,15 @@ from core.client import (
     DRAINAGE_ON_SALE,
     DRAINAGE_SOLD_OUT_TODAY,
 )
+from core.pause import RushPausedError, is_paused
 from core.run_logger import RunLogger
 from core.time_sync import measure_offset, seconds_until
 
 logger = logging.getLogger(__name__)
+
+
+class PlanValidationError(RuntimeError):
+    """待抢套餐不在下单白名单(自检拦截,已单独告警,勿再按 crashed 通知)。"""
 
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
@@ -41,6 +47,26 @@ __all__ = ["RushFlow", "next_interval", "SOLD_OUT_WORDS", "ALREADY_WORDS",
 
 def is_system_error(ex) -> bool:
     return classify_error(ex) is Outcome.SYSTEM_ERROR
+
+
+def phase_pacing(sale_s: float) -> tuple:
+    """按距开售秒数返回 (间隔倍率, 节流豁免, 是否收兵)。
+
+    黄金窗(开售前0.5s~后0.8s)豁免节流全速夺名额;尾段(后2s起)降密度
+    扫尾;开售后 10s 主动收兵——66 名额早尽,继续打只烧账号频控额度。
+    """
+    try:
+        if sale_s >= settings.RUSH_TAIL_STOP_S:
+            return (0.0, False, True)
+        if settings.RUSH_PEAK_FROM <= sale_s <= settings.RUSH_PEAK_TO:
+            return (1.0, True, False)     # 黄金窗:全速豁免
+        if sale_s >= settings.RUSH_TAIL_FROM:
+            return (settings.RUSH_TAIL_DENSITY, False, False)
+        return (1.0, False, False)        # 提前窗/回落段:常规+自适应节流
+    except Exception:   # 配置缺失/类型异常:退化为常规节奏,绝不因分段崩
+        logging.getLogger(__name__).exception(
+            "phase_pacing 分段判定异常,退化常规节奏 sale_s=%s", sale_s)
+        return (1.0, False, False)
 
 
 def next_interval(attempt: int, elapsed: float,
@@ -70,8 +96,18 @@ class RushFlow:
         self.logs = run_logger or RunLogger(log_dir, mode="rush")
         self.client.run_logger = self.logs
         self.last_result: dict = {}   # rush() 结束后的结果摘要（通知用）
+        self._result_lock = threading.Lock()   # 并发 worker 的终态写入锁
 
     # -------------------------------------------------------------- helpers
+    def validate_plans(self) -> list:
+        """起跑前一致性自检：所有待抢套餐必须在下单白名单内。
+
+        返回违规 panel_type 列表（空=通过）。防配置漂移/上游同步带回
+        备选导致买错——与抢购循环内的逐发硬闸构成双保险。
+        """
+        bad = [p.get("panel_type") for p in self.plans
+               if p.get("panel_type") not in settings.ALLOWED_PANEL_TYPES]
+        return [b for b in bad if b is not None]
     def _set_phase(self, phase: str):
         self.client.phase = phase
 
@@ -82,6 +118,17 @@ class RushFlow:
     def precheck(self) -> dict:
         """开售前自检，返回简要状态。"""
         self._set_phase("precheck")
+        bad = self.validate_plans()
+        if bad:
+            from core.notify import notify_all
+            self._record("plan_whitelist_violation", panels=bad,
+                         allowed=sorted(settings.ALLOWED_PANEL_TYPES))
+            notify_all("[B站抢购] 配置异常已拦截",
+                       f"检测到白名单外套餐 {bad}，本轮与后续抢购已中止。\n"
+                       "请检查 TARGET_PLANS/ALLOWED_PANEL_TYPES 后恢复。")
+            raise PlanValidationError(
+                f"套餐白名单校验失败: {bad}，拒绝起跑")
+
         card = self.client.get_attract_card()
         self._record("attract_card", **card)
         status = card.get("drainage_status")
@@ -95,7 +142,10 @@ class RushFlow:
             token = plan["act_token"]
             st = buy_sets.get(token)
             plan["_eligible"] = None if st is None else not st.get("hasBuy")
-            self._record("buy_set", token=token, state=st)
+            # 已购则本轮跳过下单（宁可不动，绝不多买）
+            plan["_skip"] = bool(st and st.get("hasBuy"))
+            self._record("buy_set", token=token, state=st,
+                         skip=plan["_skip"])
 
         logger.info(
             "状态=%s 已预约=%s 已购=%s 下次开售=%s",
@@ -118,15 +168,32 @@ class RushFlow:
         card = self.client.get_attract_card()
         if target_ts is None:
             target_ts = float(card["next_open_at"])
+        # 校时:B 站接口为准(目标时钟),NTP 毫秒级交叉验证——
+        # B 站 current_time 是秒级整数,采样可能被网络抖动污染;
+        # 与 NTP 偏差过大时重采样一次,取更接近 NTP 的一组
+        from core.time_sync import measure_ntp_offset
+        ntp_off = measure_ntp_offset()
         offset = measure_offset(self.client.get_server_time,
                                 samples=settings.TIME_SYNC_SAMPLES)
-        logger.info("时钟偏移 %+0.3fs，目标开售 %s",
-                    offset, datetime.fromtimestamp(target_ts))
+        if ntp_off is not None and abs(offset - ntp_off) > 0.5:
+            logger.warning("B站校时 %+0.3fs 与 NTP %+0.3fs 偏差大,重采样",
+                           offset, ntp_off)
+            offset2 = measure_offset(self.client.get_server_time,
+                                     samples=settings.TIME_SYNC_SAMPLES)
+            offset = (offset2 if abs(offset2 - ntp_off) < abs(offset - ntp_off)
+                      else offset)
+        logger.info("时钟偏移 %+0.3fs(NTP %+0.4fs)，目标开售 %s",
+                    offset, ntp_off if ntp_off is not None else float("nan"),
+                    datetime.fromtimestamp(target_ts))
         self._record("calibrated", offset_s=round(offset, 3),
+                     ntp_offset_s=(round(ntp_off, 4)
+                                   if ntp_off is not None else None),
                      target_ts=target_ts)
 
         early = settings.RUSH_EARLY_SECONDS if early_seconds is None else early_seconds
         total = settings.RUSH_DURATION_SECONDS if duration is None else duration
+        n_workers = max(1, int(settings.RUSH_CONCURRENCY))
+        self._worker_clients = []
 
         # 显式等待：长距离每秒刷新倒计时；T-3s 预热连接（DNS+TLS 进池）；
         # 最后 0.2s 忙等消除系统定时器粒度（Windows sleep 粒度 ~15ms）
@@ -137,6 +204,9 @@ class RushFlow:
             if remain <= 0:
                 break
             if remain > 3.5:
+                # 倒计时期间每秒检查暂停：仪表盘点暂停后本轮立即中止
+                if is_paused():
+                    raise RushPausedError("倒计时等待期间服务被暂停")
                 m, s = divmod(int(remain), 60)
                 h, m = divmod(m, 60)
                 print(f"\r      距开售 {h:02d}:{m:02d}:{s:02d}   ",
@@ -145,9 +215,52 @@ class RushFlow:
                 continue
             if not prewarmed and remain <= 3.0:
                 prewarmed = True
-                ok = self.client.prewarm()
-                self._record("prewarm", ok=ok)
-                logger.info("连接预热 %s", "成功" if ok else "失败(忽略)")
+                # 每路独立 client 独立连接池，逐路预热（此时距开售>2s，
+                # 预热耗时充裕）；耗时最慢的一路作为网络往返实测
+                # 多路时串行预热来不及(T-3s 内),线程池并发预热
+                # 多路本身即多连接,每路 1 条;单路才按配置多条
+                from concurrent.futures import ThreadPoolExecutor
+                self._worker_clients = [self.client]
+                for i in range(n_workers - 1):
+                    try:
+                        self._worker_clients.append(self._spawn_client())
+                    except Exception:   # 单路创建失败:跳过,少一路不废轮
+                        logger.exception("预热期 worker-%s 创建失败,跳过",
+                                         i + 1)
+                per = (max(1, settings.PREWARM_CONNECTIONS)
+                       if n_workers <= 3 else 1)
+                try:
+                    pool = ThreadPoolExecutor(
+                        max_workers=min(n_workers,
+                                        settings.RUSH_PREWARM_PARALLEL))
+                    try:
+                        times = list(pool.map(
+                            lambda c: c.prewarm(connections=per),
+                            self._worker_clients))
+                    finally:
+                        pool.shutdown(wait=True)
+                    vals = [t for t in times if t is not None]
+                    worst = max(vals) if vals else None
+                except Exception:   # 线程池整体失败:降级为不预热裸打
+                    logger.exception("并发预热整体失败,降级裸连(不影响开抢)")
+                    worst = None
+                self._record(
+                    "prewarm", workers=n_workers,
+                    ok=bool(worst is not None),
+                    worst_ms=round(worst * 1000) if worst else None)
+                logger.info("连接预热 %s（%s 路）",
+                            f"实测 {worst * 1000:.0f}ms" if worst else "失败(忽略)",
+                            n_workers)
+                # 自适应第一发提前量：按预热实测往返收紧/放宽，仅未显式
+                # 指定 early_seconds 时生效；重算等待点后重新进循环
+                if (settings.RUSH_EARLY_ADAPTIVE and worst is not None
+                        and early_seconds is None):
+                    early = min(2.2, max(1.8, worst * 2 + 0.15))
+                    wait_until = target_ts - early
+                    self._record("early_adjusted", early_s=round(early, 3),
+                                 measured_rtt_ms=round(worst * 1000))
+                    logger.info("自适应提前量 %.2fs", early)
+                continue
             if remain > 0.2:
                 time.sleep(0.05)
             else:
@@ -155,53 +268,180 @@ class RushFlow:
                     pass   # 忙等：短自旋换毫秒级触发精度
         print()   # 结束倒计时行，避免与后续日志粘行
 
-        self._set_phase("rush")
-        self._record("rush_start", target_ts=target_ts, offset=offset,
-                     prewarmed=prewarmed)
+        # 开抢前最后一道闸：T-3s 内暂停同样中止，宁可错过不误买
+        if is_paused():
+            raise RushPausedError("开抢前服务处于暂停状态")
 
+        self._set_phase("rush")
+        self._lead_s = early    # 实际提前量:循环 elapsed 换算距开售秒数
+        self._record("rush_start", target_ts=target_ts, offset=offset,
+                     prewarmed=prewarmed, workers=n_workers, lead_s=early)
+
+        counter = {"lock": threading.Lock(), "n": 0, "timed_out": False,
+                   "risk": 0, "crashed": 0, "win_total": 0, "win_702": 0, "win_rate": 0.0}
+        stop_event = threading.Event()
+        self._result_lock = threading.Lock()
         deadline = time.monotonic() + total
         rush_t0 = time.monotonic()
+
+        # worker 集合:优先用等待期预热好的;等待循环未走过(如 --now
+        # 立即开抢/目标已过)则现场生成,保证并发路数不因路径退化成单路
+        clients = list(self._worker_clients or [])
+        if not clients:
+            clients = [self.client]
+            for i in range(n_workers - 1):
+                try:
+                    clients.append(self._spawn_client())
+                except Exception:   # 单路创建失败:跳过该路,不废整轮
+                    logger.exception("worker-%s client 创建失败,跳过", i + 1)
+        if len(clients) <= 1:
+            return self._rush_attempts(deadline, total, rush_t0, stop_event,
+                                       counter, self.client, 0, interval)
+
+        orders: list = []
+        order_lock = threading.Lock()
+
+        def _worker(i: int, client):
+            try:
+                # 阶梯相位:三梯队错峰(0/0.15/0.35s)+梯队内均摊爆发节奏
+                # 66 名额场景:开售瞬间拥挤失败后,第二三波补枪命中率高
+                try:
+                    waves = tuple(settings.RUSH_WAVE_DELAYS or (0.0,))
+                except Exception:
+                    waves = (0.0,)
+                if i:
+                    wave = waves[min(i % len(waves), len(waves) - 1)]
+                    intra = (i // len(waves)) * settings.RUSH_BURST_INTERVAL \
+                        / max(1, len(clients) // len(waves))
+                    delay = wave + intra
+                    if delay > 0:
+                        time.sleep(delay)
+                o = self._rush_attempts(deadline, total, rush_t0, stop_event,
+                                         counter, client, i, interval)
+                if o is not None:
+                    with order_lock:
+                        if not orders:
+                            orders.append(o)
+                    stop_event.set()
+            except Exception as ex:   # 兜底：单路崩溃不拖垮其余路
+                with counter["lock"]:
+                    counter["crashed"] += 1
+                    crashed = counter["crashed"]
+                self._record("worker_crashed", worker=i, error=repr(ex),
+                             crashed=crashed, total=len(clients))
+                logger.exception("worker-%s 未预期异常(%s/%s 崩溃)",
+                                 i, crashed, len(clients))
+                if crashed >= len(clients):   # 全部路崩溃才放弃本轮
+                    stop_event.set()
+
+        threads = [threading.Thread(target=_worker, args=(i, c), daemon=True)
+                   for i, c in enumerate(clients)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return orders[0] if orders else None
+
+    def _spawn_client(self) -> BiliClient:
+        """为并发 worker 克隆 client：独立连接池，共享日志审计。"""
+        c = BiliClient(run_logger=self.client.run_logger,
+                       timeout=getattr(self.client, "timeout", 10.0))
+        c.phase = self.client.phase
+        return c
+
+    def _set_result(self, result: dict, force: bool = False):
+        """并发安全的终态写入：成功(force)覆盖一切；非成功仅首次写入。"""
+        lock = getattr(self, "_result_lock", None)
+        if lock is None:   # 测试用 __new__ 绕过 __init__ 的场景
+            self._result_lock = lock = threading.Lock()
+        with lock:
+            if force or not getattr(self, "last_result", None):
+                self.last_result = result
+
+    def _rush_attempts(self, deadline, total, rush_t0, stop_event, counter,
+                       client, worker_id, interval=None) -> dict | None:
+        """单路尝试循环（串行模式同样走这里）。多路共享尝试计数/停抢
+        标志/终态：任一路成功或命中终态（已购/凭证失效/售罄超时/达上限）
+        即全局停，绝不连环下单。"""
         sold_out_at = None
-        attempt = 0
         syserr_streak = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            if attempt > settings.RUSH_MAX_ATTEMPTS:
-                self._record("stop_reason", reason="max_attempts",
-                             attempts=attempt - 1)
-                logger.warning("达到尝试上限 %s 次", settings.RUSH_MAX_ATTEMPTS)
-                self.last_result = {"result": "max_attempts",
-                                    "attempts": attempt - 1}
-                return None
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            with counter["lock"]:
+                counter["n"] += 1
+                attempt = counter["n"]
+                if attempt > settings.RUSH_MAX_ATTEMPTS:
+                    self._record("stop_reason", reason="max_attempts",
+                                 attempts=attempt - 1)
+                    logger.warning("达到尝试上限 %s 次",
+                                   settings.RUSH_MAX_ATTEMPTS)
+                    self._set_result({"result": "max_attempts",
+                                      "attempts": attempt - 1})
+                    stop_event.set()
+                    return None
             for plan in self.plans:
                 if plan.get("_skip"):
                     continue
+                # 下单硬闸：panel_type 不在白名单的套餐绝不购买（防止配置
+                # 误改/带回备选导致买错套餐——09-27 备选落单事故的根治）
+                if plan.get("panel_type") not in settings.ALLOWED_PANEL_TYPES:
+                    if not plan.get("_blocked_logged"):
+                        plan["_blocked_logged"] = True
+                        self._record("panel_blocked", plan=plan["name"],
+                                     panel_type=plan.get("panel_type"),
+                                     allowed=sorted(
+                                         settings.ALLOWED_PANEL_TYPES))
+                        logger.error(
+                            "套餐 %s(panel_type=%s)不在下单白名单，已拒买",
+                            plan["name"], plan.get("panel_type"))
+                    continue
                 try:
-                    order = self.client.create_order(plan)
+                    order = client.create_order(plan)
                     try:
-                        pay_link = self.client.pay_link(plan)
+                        pay_link = client.pay_link(plan)
                     except Exception:  # 日志辅助失败不影响主流程
                         pay_link = ""
                     # 双重校验：create 成功后向 order/status 确认订单状态
                     try:
-                        order_status = self.client.get_order_status(order)
+                        order_status = client.get_order_status(order)
                     except Exception as ex:
                         order_status = {"check_error": str(ex)}
                     self._record("order_ok", attempt=attempt,
+                                 worker=worker_id,
                                  plan=plan["name"], order=order,
                                  order_status=order_status,
                                  pay_link=pay_link)
-                    logger.info("下单成功: %s -> %s (status=%s)",
-                                plan["name"], order, order_status)
-                    self.last_result = {"result": "success", "order": order,
-                                        "pay_link": pay_link,
-                                        "attempts": attempt}
+                    logger.info("下单成功(worker-%s): %s -> %s (status=%s)",
+                                worker_id, plan["name"], order, order_status)
+                    self._set_result({"result": "success", "order": order,
+                                      "pay_link": pay_link,
+                                      "attempts": attempt}, force=True)
+                    stop_event.set()
                     return order
                 except BiliApiError as ex:
                     text = (ex.response_text or "")[:500]
                     self._record("order_fail", attempt=attempt,
+                                 worker=worker_id,
                                  plan=plan["name"], code=ex.code,
                                  message=str(ex), raw=text)
+                    # 风控熔断:412/403 达阈值即全局停(多路并发下防持续
+                    # 轰炸被拉黑——宁可停手保账号)
+                    if ex.code in (412, 403):
+                        with counter["lock"]:
+                            counter["risk"] += 1
+                            risk = counter["risk"]
+                        if risk >= settings.RUSH_RISK_PAUSE:
+                            self._record("stop_reason", reason="risk_control",
+                                         code=ex.code, hits=risk)
+                            logger.error("疑似触发风控(412/403 x%s),全局停抢", risk)
+                            self._set_result({"result": "risk_control",
+                                              "attempts": attempt})
+                            stop_event.set()
+                            return None
+                    # -702 频控窗口统计(自适应节流依据)
+                    with counter["lock"]:
+                        counter["win_total"] += 1
+                        if ex.code == -702:
+                            counter["win_702"] += 1
                     outcome = classify_error(ex)
                     if outcome is Outcome.CREDENTIAL_EXPIRED:
                         self._record("stop_reason",
@@ -211,15 +451,17 @@ class RushFlow:
                             "凭证失效(%s)，重试无意义。请重新抓包更新 "
                             "config/secrets.py 或环境变量 BILI_* 后再战。",
                             ex.code)
-                        self.last_result = {"result": "credential_expired",
-                                            "attempts": attempt}
+                        self._set_result({"result": "credential_expired",
+                                          "attempts": attempt})
+                        stop_event.set()
                         return None
                     if outcome is Outcome.ALREADY_DONE:
                         self._record("stop_reason", reason="already_owned",
                                      message=str(ex))
                         logger.info("已有订单/已购买，停止: %s", ex)
-                        self.last_result = {"result": "already_owned",
-                                            "attempts": attempt}
+                        self._set_result({"result": "already_owned",
+                                          "attempts": attempt})
+                        stop_event.set()
                         return None
                     if outcome is Outcome.SOLD_OUT:
                         if sold_out_at is None:
@@ -229,8 +471,9 @@ class RushFlow:
                             self._record("stop_reason", reason="sold_out",
                                          message=str(ex))
                             logger.info("已售罄，停止重试")
-                            self.last_result = {"result": "sold_out",
-                                                "attempts": attempt}
+                            self._set_result({"result": "sold_out",
+                                              "attempts": attempt})
+                            stop_event.set()
                             return None
                     elif outcome is Outcome.SYSTEM_ERROR:
                         syserr_streak += 1
@@ -246,12 +489,46 @@ class RushFlow:
                         syserr_streak = 0
                 except Exception as ex:  # 未预期异常：留现场后继续下一轮
                     self._record("unexpected_error", attempt=attempt,
+                                 worker=worker_id,
                                  plan=plan["name"],
                                  error=repr(ex))
                     logger.exception("下单未预期异常")
             elapsed = time.monotonic() - rush_t0
-            time.sleep(next_interval(attempt, elapsed, interval))
-        self._record("rush_timeout", attempts=attempt)
-        logger.warning("坚持 %ss 后仍未抢到", total)
-        self.last_result = {"result": "timeout", "attempts": attempt}
+            # 时间分段火力 + -702 自适应节流(任何计算异常退化为保守
+            # 1s 间隔继续打,本路绝不因节奏计算退出)
+            try:
+                sale_s = elapsed - getattr(self, "_lead_s", 0.0)  # 距开售
+                dens, exempt, stop_now = phase_pacing(sale_s)
+            except Exception:
+                logger.exception("节奏计算异常,保守节奏继续")
+                self._record("pacing_fallback", worker=worker_id)
+                dens, exempt, stop_now = 1.0, False, False
+            if stop_now:
+                with counter["lock"]:
+                    first = not counter["timed_out"]
+                    counter["timed_out"] = True
+                if first:
+                    self._record("tail_stop", sale_s=round(sale_s, 2),
+                                 attempts=counter["n"])
+                    logger.info("尾段收兵(开售后 %ss)", sale_s)
+                    self._set_result({"result": "timeout",
+                                      "attempts": counter["n"]})
+                stop_event.set()
+                return None
+            with counter["lock"]:
+                if counter["win_total"] >= settings.RUSH_THROTTLE_WINDOW:
+                    counter["win_rate"] = (counter["win_702"]
+                                           / counter["win_total"])
+                    counter["win_total"] = counter["win_702"] = 0
+                rate = counter.get("win_rate", 0.0)
+            extra = 0.0 if exempt else settings.RUSH_THROTTLE_MAX_S * rate
+            time.sleep(next_interval(attempt, elapsed, interval) * dens
+                       + extra)
+        with counter["lock"]:
+            first_timeout = not counter["timed_out"]
+            counter["timed_out"] = True
+        if first_timeout and not stop_event.is_set():
+            self._record("rush_timeout", attempts=counter["n"])
+            logger.warning("坚持 %ss 后仍未抢到", total)
+            self._set_result({"result": "timeout", "attempts": counter["n"]})
         return None

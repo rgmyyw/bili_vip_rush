@@ -20,10 +20,10 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from config import settings                # noqa: E402
 from core.auth import (                     # noqa: E402
     credentials_view,
-    qrcode_poll,
-    qrcode_start,
+    import_har_credentials,
     save_credentials,
 )
 from core.client import BiliClient          # noqa: E402
@@ -32,6 +32,7 @@ from core.logstats import (                 # noqa: E402
     list_runs,
     load_rows,
 )
+from core.pause import set_paused          # noqa: E402
 from core.notify import (                   # noqa: E402
     notify_config_view,
     save_notify_config,
@@ -61,6 +62,35 @@ def refresh_live(max_age_s: float = 4.0) -> dict:
     with _status_lock:
         _live.update(snap)
     return dict(snap)
+
+
+# ---------------------------------------------------------------- 凭证体检
+_cred_lock = threading.Lock()
+_cred = {"ts": 0.0, "state": ""}
+
+
+def refresh_cred(max_age_s: float = 120.0) -> str:
+    """凭证体检：missing=未配置（不打接口）/ valid / invalid / unknown。
+
+    探针是必须登录的 App 端 myinfo——attract_card 匿名也返回 code=0，
+    之前"凭证有效"卡片实际只反映接口可达，属误报。结果缓存 2 分钟，
+    避免前端 5s 轮询打爆体检接口。
+    """
+    # 先按 env > credentials.json > secrets.py 重载：扫码/表单保存后
+    # dashboard 进程的模块常量不会自动刷新（抢购进程有每轮重载，这里没有）
+    from core.auth import reload_credentials_into_settings
+    reload_credentials_into_settings()
+    if not settings.ACCESS_KEY:
+        return "missing"
+    with _cred_lock:
+        if _cred["state"] and time.time() - _cred["ts"] < max_age_s:
+            return _cred["state"]
+    client = BiliClient(run_logger=NullRunLogger(), timeout=8)
+    ok = client.check_login()
+    state = "valid" if ok else ("invalid" if ok is False else "unknown")
+    with _cred_lock:
+        _cred.update(ts=time.time(), state=state)
+    return state
 
 
 # ---------------------------------------------------------------- HTTP 服务
@@ -120,6 +150,8 @@ PAGE = """<!DOCTYPE html>
    <div><div class="k">发件邮箱</div><input id="f_user" placeholder="you@qq.com"></div>
    <div><div class="k">SMTP 授权码</div><input id="f_pass" type="password" placeholder=""></div>
    <div><div class="k">收件邮箱 (留空=发给自己)</div><input id="f_to" placeholder="me@qq.com"></div>
+   <div><div class="k">钉钉 Webhook (选配)</div><input id="f_ding_webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."></div>
+   <div><div class="k">钉钉加签 Secret (选配)</div><input id="f_ding_secret" type="password" placeholder="SEC..."></div>
   </div>
   <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
    <button onclick="saveCfg()">保存</button>
@@ -134,15 +166,12 @@ PAGE = """<!DOCTYPE html>
     <span class="muted" id="csummary" style="margin-left:8px"></span></div>
   <div style="display:flex;gap:8px">
    <button onclick="verifyCred()">验证</button>
-   <button onclick="qrLogin()">扫码登录</button>
+   <button onclick="pickHar()">上传HAR</button>
    <button onclick="toggleCredForm()">手动更新</button>
+   <input type="file" id="harfile" accept=".har,.json" style="display:none" onchange="uploadHar(this)">
   </div>
  </div>
- <div id="qrbox" style="display:none;margin-top:14px;text-align:center">
-  <div id="qrgrid" style="display:inline-block"></div>
-  <div id="qrmsg" class="muted" style="margin-top:8px">用手机 B站 App 扫码并确认登录</div>
- </div>
- <div id="cform" style="display:none;margin-top:12px">
+  <div id="cform" style="display:none;margin-top:12px">
   <div class="muted" style="margin-bottom:8px">粘贴抓包凭证（留空=不修改该字段；与本地 secrets.py 字段级共存）</div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">
    <div><div class="k">access_key (App)</div><input id="c_access_key"></div>
@@ -185,6 +214,12 @@ function liveCards(d){
   const stMap = {ON_SALE:["开售中!","ok"], SOLD_OUT_TODAY:["今日售罄","warn"],
                  ABOUT_TO_OPEN:["即将开售","warn"], NOT_ON_SALE:["未开售",""]};
   const st = d.ok ? (stMap[d.data.drainage_status]||[d.data.drainage_status,""]) : ["查询失败","bad"];
+  // 凭证体检三态；预约/已购买是账号视角数据，凭证未验证有效前显示 —
+  const credMap = {valid:["有效","ok"], invalid:["失效","bad"],
+                   missing:["未配置","warn"], unknown:["无法判定","warn"]};
+  const cred = d.cred ? (credMap[d.cred]||["?",""]) : ["?",""];
+  const acctOk = d.cred === "valid";
+  const pv = d.paused || {};
   return `
   <div class="card"><div class="k">实时状态</div>
     <div class="v ${st[1]}">${st[0]}</div>
@@ -193,11 +228,15 @@ function liveCards(d){
     <div class="v ${d.ok?"warn":""}">${cnt||"—"}</div>
     <div class="k">${next}</div></div>
   <div class="card"><div class="k">预约</div>
-    <div class="v ${d.ok&&d.data.isReserved?"ok":""}">${d.ok?(d.data.isReserved?"已预约":"未预约"):"—"}</div></div>
+    <div class="v ${acctOk&&d.data.isReserved?"ok":""}">${acctOk?(d.data.isReserved?"已预约":"未预约"):"—"}</div></div>
   <div class="card"><div class="k">已购买</div>
-    <div class="v ${d.ok&&d.data.has_buy?"ok":""}">${d.ok?(d.data.has_buy?"是":"否"):"—"}</div></div>
+    <div class="v ${acctOk&&d.data.has_buy?"ok":""}">${acctOk?(d.data.has_buy?"是":"否"):"—"}</div></div>
   <div class="card"><div class="k">凭证</div>
-    <div class="v ${d.ok?"ok":"bad"}">${d.ok?"有效":"失效/网络异常"}</div></div>`;
+    <div class="v ${cred[1]}">${cred[0]}</div>
+    <div class="k">${d.cred==="missing"?"填 .env 后 up -d 生效":""}</div></div>
+  <div class="card"><div class="k">抢购服务</div>
+    <div class="v ${pv.paused?"bad":"ok"}">${pv.paused?"已暂停":"运行中"}</div>
+    <div class="k">${pv.paused?((pv.reason||"")+" · "):""}<button onclick="togglePause(${!pv.paused})">${pv.paused?"恢复抢购":"暂停抢购"}</button></div></div>`;
 }
 
 async function refreshLive(){
@@ -272,6 +311,11 @@ async function refreshNotify(){
       src.to === "仪表盘" ? ((c.to === c.user) ? "" : (c.to || "")) : "";
     document.getElementById("f_pass").placeholder =
       c.pass_set ? `已设置(来源:${src.pass})，留空则用本地配置` : "邮箱设置里生成的授权码";
+    const dw = document.getElementById("f_ding_webhook");
+    dw.value = (src.dingtalk === "仪表盘" && c.dingtalk_webhook) ? c.dingtalk_webhook : "";
+    dw.placeholder = c.dingtalk_set ? "已配置" + (src.dingtalk === "仪表盘" ? "" : "(本地)") + "，留空=不改，清空=停用钉钉" : "选配，凭证失效时双通道告警";
+    document.getElementById("f_ding_secret").placeholder =
+      c.dingtalk_set ? "已设置，留空=不改" : "选配，机器人加签 SEC 开头";
   }
 }
 function toggleForm(){
@@ -286,10 +330,12 @@ async function saveCfg(){
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({
       host: f_host.value.trim(), port: +f_port.value || 465,
-      user: f_user.value.trim(), pass: f_pass.value, to: f_to.value.trim()})});
+      user: f_user.value.trim(), pass: f_pass.value, to: f_to.value.trim(),
+      dingtalk_webhook: f_ding_webhook.value.trim(),
+      dingtalk_secret: f_ding_secret.value})});
   const d = await r.json();
   msg.textContent = d.error ? d.error : "已保存" + (d.enabled ? "，通知已启用" : "（信息不全，未启用）");
-  f_pass.value = ""; refreshNotify();
+  f_pass.value = ""; f_ding_secret.value = ""; refreshNotify();
 }
 async function testMail(){
   const msg = document.getElementById("nmsg");
@@ -325,61 +371,43 @@ async function saveCred(){
       sessdata: c_sessdata.value.trim(), bili_jct: c_bili_jct.value.trim(),
       uid: c_uid.value.trim()})});
   const d = await r.json();
-  msg.textContent = d.error ? d.error : "已保存，立即生效（可用上方\"验证\"实测）";
+  msg.textContent = d.error ? d.error : "已保存，立即生效（可用上方「验证」实测）";
   ["c_access_key","c_csrf","c_sessdata","c_bili_jct","c_uid"].forEach(id=>{
     document.getElementById(id).value = "";});
   refreshCred();
 }
+function pickHar(){ document.getElementById("harfile").click(); }
+async function uploadHar(input){
+  const f = input.files && input.files[0];
+  input.value = "";
+  if(!f) return;
+  const st = document.getElementById("cstate");
+  st.textContent = "导入中..."; st.className = "tag done";
+  const text = await f.text();
+  const d = await j2("/api/har-import", "POST", {har: text});
+  if(d.error){ st.textContent = "导入失败"; st.className = "tag credential_expired";
+    alert("HAR 导入失败: " + d.error + (d.missing ? "\\n缺失: " + d.missing : ""));
+    refreshCred(); return; }
+  st.textContent = "已导入 ✓"; st.className = "tag success";
+  alert("凭证已更新 ✓\\n来源接口: " + (d.source_api || "?") +
+        "\\n更新字段: " + (d.updated_fields || []).join(", ") + (d.missing && d.missing.length ? "\\n未包含(保留旧值): " + d.missing.join(", ") : ""));
+  refreshCred(); refreshLive();
+}
+async function togglePause(toPause){
+  if(toPause && !confirm("确认暂停抢购服务？\\n暂停后：到点不再起跑，倒计时中的一轮也会立即中止。")) return;
+  await j2("/api/pause", "POST", {paused: toPause, reason: "仪表盘手动操作"});
+  refreshLive();
+}
 async function verifyCred(){
   const st = document.getElementById("cstate");
   st.textContent = "验证中...";
-  const d = await j("/api/summary");
-  st.textContent = d.ok ? "有效 ✓" : "失效/异常";
-  st.className = "tag " + (d.ok ? "success" : "credential_expired");
-}
-let qrTimer = null;
-async function qrLogin(){
-  document.getElementById("qrbox").style.display = "block";
-  document.getElementById("qrmsg").textContent = "生成二维码...";
-  document.getElementById("qrgrid").innerHTML = "";
-  const d = await j2("/api/qrcode/start", "POST");
-  if(d.error){
-    document.getElementById("qrmsg").textContent = d.error;
-    return;
-  }
-  renderQR(d.matrix);
-  document.getElementById("qrmsg").textContent =
-    "用手机 B站 App 扫码并确认登录" + (d.qr_error ? "（"+d.qr_error+"）" : "");
-  if(qrTimer) clearInterval(qrTimer);
-  qrTimer = setInterval(async ()=>{
-    const p = await j2("/api/qrcode/poll", "POST", {auth_code: d.auth_code});
-    const m = document.getElementById("qrmsg");
-    if(p.status === "success"){
-      clearInterval(qrTimer); m.textContent = "✓ " + p.message;
-      setTimeout(()=>{document.getElementById("qrbox").style.display="none";}, 2000);
-      refreshCred();
-    } else if(p.status === "expired" || p.status === "error"){
-      clearInterval(qrTimer); m.textContent = p.message;
-    } else if(p.status === "scanned"){
-      m.textContent = p.message;
-    }
-  }, 2000);
-}
-function renderQR(matrix){
-  if(!matrix){ return; }
-  const n = matrix.length, cell = Math.max(3, Math.min(8, Math.floor(240/n)));
-  const grid = document.getElementById("qrgrid");
-  grid.innerHTML = "";
-  grid.style.display = "grid";
-  grid.style.gridTemplateColumns = `repeat(${n}, ${cell}px)`;
-  grid.style.gap = "0";
-  grid.style.background = "#fff"; grid.style.padding = "8px"; grid.style.borderRadius = "8px";
-  matrix.forEach(row => row.forEach(v=>{
-    const d = document.createElement("div");
-    d.style.width = cell+"px"; d.style.height = cell+"px";
-    d.style.background = v ? "#000" : "#fff";
-    grid.appendChild(d);
-  }));
+  const d = await j2("/api/cred-check", "POST", {});
+  // d.ok 只代表活动接口可达（匿名也 true），凭证有效性看 cred 体检结果
+  const m = {valid:["有效 ✓","success"], invalid:["失效","credential_expired"],
+             missing:["未配置","credential_expired"], unknown:["无法判定","done"]};
+  const r = m[d.cred] || ["无法判定","done"];
+  st.textContent = r[0];
+  st.className = "tag " + r[1];
 }
 async function j2(u, method, body){
   const r = await fetch(u, {method, headers:{"Content-Type":"application/json"},
@@ -435,29 +463,41 @@ class Handler(BaseHTTPRequestHandler):
                        "uid": "bili_uid"}
             creds = {mapping[k]: v for k, v in body.items() if k in mapping}
             try:
-                return self._json(save_credentials(creds, source="仪表盘"))
+                out = save_credentials(creds, source="仪表盘")
+                _cred.update(state="")   # 凭证已变，清体检缓存立即反映
+                return self._json(out)
             except Exception as ex:
                 return self._json({"error": f"保存失败: {ex}"[:200]}, 500)
-        if path == "/api/qrcode/start":
+        if path == "/api/cred-check":
+            # 立即强制体检(绕过缓存),供"验证"按钮与外部探测
+            from core.credwatch import check_once
+            ok = check_once()
+            out = {"cred": ("valid" if ok else
+                            ("invalid" if ok is False else "unknown")),
+                   "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            if out["cred"] == "invalid":
+                out["hint"] = "凭证已失效,请重新抓包后点「上传HAR」"
+            self._json(out)
+            return
+        if path == "/api/har-import":
+            har_text = str(body.get("har") or "")
+            if not har_text.strip():
+                return self._json({"error": "缺少 har 字段(HAR 文本)"}, 400)
+            if len(har_text) > 20 * 1024 * 1024:
+                return self._json({"error": "HAR 过大(>20MB)"}, 400)
             try:
-                start = qrcode_start()
+                out = import_har_credentials(har_text)
             except Exception as ex:
-                return self._json({"error": f"{ex}"[:200]}, 500)
-            try:
-                import qrcode as _qr
-                qr = _qr.QRCode(border=1)
-                qr.add_data(start["url"])
-                start["matrix"] = qr.get_matrix()
-            except Exception as ex:       # qrcode 库缺失时退化为仅链接
-                start["matrix"] = None
-                start["qr_error"] = f"二维码渲染失败({ex})，请安装: pip install qrcode"
-            return self._json(start)
-        if path == "/api/qrcode/poll":
-            auth_code = str(body.get("auth_code") or "")
-            if not auth_code:
-                return self._json({"status": "error",
-                                   "message": "缺少 auth_code"}, 400)
-            return self._json(qrcode_poll(auth_code))
+                return self._json({"error": f"导入失败: {ex}"[:200]}, 500)
+            if not out.get("error"):
+                _cred.update(state="")   # 凭证已变，清体检缓存立即反映
+            return self._json(out)
+        if path == "/api/pause":
+            paused = bool(body.get("paused"))
+            reason = str(body.get("reason") or "").strip()
+            if paused and not reason:
+                reason = "仪表盘手动暂停"
+            return self._json(set_paused(paused, reason))
         return self._json({"error": "not found"}, 404)
 
     def do_GET(self):
@@ -470,7 +510,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif path == "/api/summary":
-            self._json(refresh_live())
+            out = refresh_live()
+            out["cred"] = refresh_cred()
+            from core.pause import pause_state
+            out["paused"] = pause_state()
+            self._json(out)
         elif path == "/api/runs":
             self._json(list_runs(LOGS_DIR))
         elif path == "/api/notify-config":

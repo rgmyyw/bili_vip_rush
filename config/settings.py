@@ -16,6 +16,8 @@ from pathlib import Path
 NOTIFY_JSON_PATH = Path(__file__).resolve().parent / "notify.json"
 # 仪表盘保存/扫码登录刷新的登录凭证文件（不入 git/镜像）
 CREDENTIALS_JSON_PATH = Path(__file__).resolve().parent / "credentials.json"
+# 服务暂停开关（仪表盘写入，daemon 触发点与 rush 倒计时每秒检查）
+PAUSE_JSON_PATH = Path(__file__).resolve().parent / "pause.json"
 
 try:
     from config import secrets as _secrets
@@ -31,6 +33,8 @@ except ImportError:   # 未创建 secrets.py 时退化为空凭证
         SMTP_USER = ""
         SMTP_PASS = ""
         NOTIFY_TO = ""
+        DINGTALK_WEBHOOK = ""
+        DINGTALK_SECRET = ""
 
 
 def _notify_json() -> dict:
@@ -77,6 +81,11 @@ SMTP_PORT = int(_cred("BILI_SMTP_PORT", "SMTP_PORT", "port") or 465)
 SMTP_USER = _cred("BILI_SMTP_USER", "SMTP_USER", "user")
 SMTP_PASS = _cred("BILI_SMTP_PASS", "SMTP_PASS", "pass")
 NOTIFY_TO = _cred("BILI_NOTIFY_TO", "NOTIFY_TO", "to") or SMTP_USER
+# 钉钉推送（选配）：机器人 webhook（可带加签 secret），齐备才启用
+DINGTALK_WEBHOOK = _cred("BILI_DINGTALK_WEBHOOK", "DINGTALK_WEBHOOK",
+                         "dingtalk_webhook")
+DINGTALK_SECRET = _cred("BILI_DINGTALK_SECRET", "DINGTALK_SECRET",
+                        "dingtalk_secret")
 
 # ----------------------------------------------------------------------------
 # App 签名参数（B站安卓客户端公开 appkey/appsec）
@@ -97,6 +106,9 @@ APP_UA = (
 # 接口地址
 # ----------------------------------------------------------------------------
 API_BASE = "https://api.bilibili.com"
+# 凭证体检探针：App 端账号接口（无/失效凭证返回 code=61000 或 -400/-101，
+# 有效返回 0）。attract_card 匿名也返回 0，不能用作体检。
+URL_MY_INFO = "https://app.bilibili.com/x/v2/account/myinfo"
 URL_ATTRACT_CARD = f"{API_BASE}/x/vip/activity/sale/summer2026/attract_card"
 URL_RESERVE = f"{API_BASE}/x/vip/activity/sale/summer2026/reserve"
 URL_BUY_COMPONENT = f"{API_BASE}/pgc/activity/dokodemoDoor/getEasy/moe2026_buyComponentEvo_info"
@@ -113,13 +125,12 @@ EXT_PARAMS = {
 }
 
 # ----------------------------------------------------------------------------
-# 目标套餐（开售后依次尝试，第一个锁单成功即停）
+# 目标套餐：唯一、只抢这一个，禁止任何备选/兜底购买。
 #
-# 178 元"买1年得5年"限量套餐有两个候选入口：
-#   1) BuyGiveRewards 买赠组件的 tv 超级大会员（云视听小电视，截图"超大会员372天"），
-#      资格 token 在 buyComponentEvo_info 的 buySets 中返回；
-#   2) OgvVipBuyBase 的 26moe_xny178 年卡按钮。
-# orderType: 1=连续包年(cdd178 是 isContinuous) 0=单次(xny178 renew=false)
+# 26moe_cdd178 = 178 元"买1年得5年"超级大会员（含 QQ音乐豪华年卡/知乎年卡/
+# 肯德基大神卡/京东plus 各一年，云视听小电视 tv 组件，isContinuous 连续包年）。
+# 资格 token 在 buyComponentEvo_info 的 buySets 中返回。
+# 抢不到就是抢不到，绝不落到其他 178 套餐（见 ALLOWED_PANEL_TYPES 硬闸）。
 # ----------------------------------------------------------------------------
 TARGET_PLANS = [
     {
@@ -132,17 +143,15 @@ TARGET_PLANS = [
         "order_type": 1,
         "product_type": "1",
     },
-    {
-        "name": "178年卡(26moe_xny178, 单次)",
-        "act_token": "748184168320260824193741",
-        "app_id": "241",
-        "app_sub_id": "26moe_fhc",
-        "panel_type": "26moe_xny178",
-        "months": 12,
-        "order_type": 0,
-        "product_type": "1",
-    },
+    # 2026-09-28 删除 26moe_xny178(178年卡N选1)备选：备选会在首选无货时
+    # 落单买错套餐（09-27 实际买到 xny178，用户损失 178 元）。
+    # 只抢 cdd178；恢复备选必须同时改 ALLOWED_PANEL_TYPES。
 ]
+
+# 下单硬性白名单：panel_type 不在此清单的套餐，抢购循环直接拒绝下单并
+# 记录 panel_blocked 事件。这是独立于 TARGET_PLANS 的第二道闸——即使配置
+# 被误改/上游同步带回备选，也不会买错套餐。要新增可买套餐须显式改这里。
+ALLOWED_PANEL_TYPES = {"26moe_cdd178"}
 
 # ----------------------------------------------------------------------------
 # 抢购节奏（借鉴 glm-rush：三段自适应间隔 + 抖动 + 多重熔断）
@@ -152,15 +161,29 @@ TARGET_PLANS = [
 #   注意：App 签名 + 同账号场景不适合多路并发同一下单（会重复下单），
 #   用爆发间隔换速度而非并发路数。
 # ----------------------------------------------------------------------------
-RUSH_EARLY_SECONDS = 0.6      # 提前量：开售前多少秒发出第一发
+RUSH_EARLY_SECONDS = 2.0      # 提前量:开售前 2s 起打(覆盖 11:59:58-12:00:02 全窗口)
+RUSH_EARLY_ADAPTIVE = True    # 按预热实测往返自适应提前量(1.8~2.2s)
+RUSH_CONCURRENCY = 10         # 开售瞬间并发路数(单IP有效并发~10-20,更高被网关丢弃反降有效量)
+PREWARM_CONNECTIONS = 2       # 每路预热连接数(填连接池,防单连接偶发失败)
 RUSH_BURST_COUNT = 8          # 前 N 次为爆发段
-RUSH_BURST_INTERVAL = 0.06    # 爆发段间隔（秒）
+RUSH_BURST_INTERVAL = 0.04    # 爆发段间隔（秒）
+RUSH_WAVE_DELAYS = (0.0, 0.15, 0.35)  # 阶梯相位:分梯队错峰起跑,覆盖开售后三波窗口
 RUSH_FAST_WINDOW = 10.0       # 开售后 N 秒内为快速段
 RUSH_FAST_INTERVAL = 0.12     # 快速段间隔
 RUSH_SLOW_INTERVAL = 0.30     # 慢速段间隔
 RUSH_JITTER = 0.30            # 间隔抖动 ±30%
-RUSH_DURATION_SECONDS = 90.0  # 开售后最长坚持时长
-RUSH_MAX_ATTEMPTS = 400       # 总尝试上限（熔断）
+RUSH_MAX_ATTEMPTS = 1000      # 总尝试上限（熔断）
+RUSH_RISK_PAUSE = 10          # 连续 N 次 412/403 风控拦截即全局停抢
+RUSH_THROTTLE_MAX_S = 2.0     # -702 频控自适应退避上限(占比100%时每路退避2s)
+# 时间分段火力(距开售秒数,负=提前):黄金窗豁免节流全速;尾段降密度;到点收兵
+RUSH_PEAK_FROM = -0.5         # 黄金窗起点(开售前0.5s)
+RUSH_PEAK_TO = 0.8            # 黄金窗终点(开售后0.8s)
+RUSH_TAIL_FROM = 2.0          # 尾段起点(降密度扫尾,捡锁单释放回流)
+RUSH_TAIL_DENSITY = 3.0       # 尾段间隔倍率
+RUSH_TAIL_STOP_S = 10.0       # 开售后 N 秒主动收兵(66名额早尽,继续打只烧频控)
+RUSH_DURATION_SECONDS = 14.0  # 总时长兜底(提前2s+黄金+尾段)
+RUSH_THROTTLE_WINDOW = 30     # 节流判定窗口(最近 N 发)
+RUSH_PREWARM_PARALLEL = 32    # 多路预热线程池大小(串行预热在多路下来不及)
 RUSH_SYSERR_PAUSE = 5         # 连续 N 次系统错误（网络/5xx）触发冷却
 RUSH_SYSERR_COOLDOWN = 2.0    # 冷却时长（秒）
 SOLD_OUT_LINGER_SECONDS = 3.0 # 收到"售罄"后再坚持几秒

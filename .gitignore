@@ -18,3 +18,5 @@ __pycache__/
 # 本地环境
 .env
 *.local.py
+# 服务暂停开关(仪表盘写入的运行时文件)
+config/pause.json

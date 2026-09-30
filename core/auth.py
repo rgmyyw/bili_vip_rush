@@ -1,16 +1,9 @@
 # -*- coding: utf-8 -*-
-"""B站 TV 端扫码登录：一次扫码拿到全套凭证。
-
-协议（passport-tv-login，appkey/appsec 为 TV 客户端公开参数）：
-    1. POST /x/passport-tv-login/qrcode/authcode -> auth_code（二维码内容）
-    2. 用户用手机 B站 App 扫码并确认
-    3. POST /x/passport-tv-login/qrcode/poll 轮询：
-       code=0     成功 -> access_token + cookie_info(SESSDATA/bili_jct/...)
-       code=86090 已扫码待确认
-       code=86038 二维码已失效
+"""凭证存取与 HAR 导入。
 
 凭证保存到 config/credentials.json（字段级合并，本地私有文件），
 读取优先级与环境变量/secrets.py 的关系见 config/settings.py。
+唯一更新入口=仪表盘「上传HAR」（TV 扫码凭证不被活动接口认可，已删除）。
 """
 import json
 import logging
@@ -23,17 +16,6 @@ from config import settings
 from core.signer import app_sign
 
 logger = logging.getLogger(__name__)
-
-TV_APP_KEY = "4409e2ce8ffd12b8"
-TV_APP_SEC = "59b43e04ad6965f34319062b478f83dd"
-LOCAL_ID = "3333333"
-
-URL_AUTHCODE = "https://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code"
-URL_POLL = "https://passport.bilibili.com/x/passport-tv-login/qrcode/poll"
-
-POLL_WAITING = 86039     # 等待扫码
-POLL_SCANNED = 86090     # 已扫码，等待确认
-POLL_EXPIRED = 86038     # 二维码失效
 
 # credentials.json 键 <-> settings 属性 / 环境变量
 CRED_FIELDS = {
@@ -56,52 +38,6 @@ def _tv_signed(params: dict) -> dict:
     params = dict(params, appkey=TV_APP_KEY, ts=int(time.time()))
     params["sign"] = app_sign(params, TV_APP_SEC)
     return params
-
-
-def qrcode_start() -> dict:
-    """申请扫码登录二维码。返回 {auth_code, url}。"""
-    try:
-        resp = _session.post(URL_AUTHCODE, timeout=10,
-                             data=_tv_signed({"local_id": LOCAL_ID}))
-        payload = resp.json()
-    except Exception as ex:
-        raise AuthError(f"申请二维码失败: {ex}") from ex
-    if payload.get("code") != 0:
-        raise AuthError(f"申请二维码失败 code={payload.get('code')} "
-                        f"{payload.get('message')}")
-    data = payload["data"]
-    return {"auth_code": data["auth_code"], "url": data["url"]}
-
-
-def qrcode_poll(auth_code: str) -> dict:
-    """轮询扫码状态（前端定时调用）。
-
-    返回 {status: waiting|scanned|success|expired|error, message, ...}
-    success 时凭证已保存并携带脱敏视图。
-    """
-    try:
-        resp = _session.post(URL_POLL, timeout=10, data=_tv_signed({
-            "auth_code": auth_code, "local_id": LOCAL_ID}))
-        payload = resp.json()
-    except Exception as ex:
-        return {"status": "error", "message": f"轮询失败: {ex}"}
-
-    code = payload.get("code")
-    if code == 0:
-        creds = _extract_credentials(payload.get("data") or {})
-        save_credentials(creds, source="扫码登录")
-        view = credentials_view()
-        view["status"] = "success"
-        view["message"] = "登录成功，凭证已更新"
-        return view
-    if code == POLL_WAITING:
-        return {"status": "waiting", "message": "等待扫码..."}
-    if code == POLL_SCANNED:
-        return {"status": "scanned", "message": "已扫码，请在手机上确认"}
-    if code == POLL_EXPIRED:
-        return {"status": "expired", "message": "二维码已失效，请重新生成"}
-    return {"status": "error",
-            "message": f"code={code} {payload.get('message', '')}"}
 
 
 def _extract_credentials(data: dict) -> dict:
@@ -209,3 +145,81 @@ def credentials_view() -> dict:
         "updated_at": js.get("updated_at", ""),
         "updated_by": js.get("updated_by", ""),
     }
+
+
+# ---------------------------------------------------------------- HAR 导入
+def parse_har_credentials(har_text: str) -> dict:
+    """从 HAR JSON 文本提取全套登录凭证（App 抓包/浏览器导出皆可）。
+
+    提取规则（按用户要求的"明确来源接口"语义）：
+      - access_key：取含该 query 参数的请求，并记录其接口为来源；
+        同一请求 query 里的 csrf 一并采用（App 签名请求惯例）。
+      - Cookie 三件套（SESSDATA/bili_jct/DeduUserID）：取全 HAR 中
+        出现的值（同一抓包会话内唯一）。
+      - csrf 若无独立来源，与 bili_jct 同值配套（B 站惯例）。
+    返回 {creds: {bili_* 键, 仅含提取到的字段}, source_api: str,
+    missing: [缺失字段名]}。不完整时仍返回已提取部分，由调用方决定。
+    """
+    from urllib.parse import urlparse, parse_qs
+
+    try:
+        har = json.loads(har_text)
+        entries = har["log"]["entries"]
+    except Exception as ex:
+        return {"creds": {}, "source_api": "", "missing": ["all"],
+                "error": f"HAR 解析失败: {ex}"[:200]}
+
+    best_ak, best_csrf, source_api = "", "", ""
+    cookie: dict = {}
+    for e in entries:
+        req = e.get("request") or {}
+        try:
+            q = parse_qs(urlparse(req.get("url", "")).query)
+        except Exception:
+            q = {}
+        ak = (q.get("access_key") or [None])[0]
+        if ak:
+            best_ak = ak
+            source_api = (req.get("method", "GET") + " "
+                          + req.get("url", "").split("?")[0])
+            if q.get("csrf"):
+                best_csrf = q["csrf"][0]
+        for h in req.get("headers", []):
+            if str(h.get("name", "")).lower() == "cookie":
+                for part in str(h.get("value", "")).split(";"):
+                    k, _, v = part.strip().partition("=")
+                    if k in ("SESSDATA", "bili_jct", "DedeUserID") and v:
+                        cookie[k] = v
+
+    creds: dict = {}
+    if best_ak:
+        creds["bili_access_key"] = best_ak
+    csrf = best_csrf or cookie.get("bili_jct", "")
+    if csrf:
+        creds["bili_csrf"] = csrf
+    if cookie.get("SESSDATA"):
+        creds["bili_sessdata"] = cookie["SESSDATA"]
+    if cookie.get("bili_jct"):
+        creds["bili_jct"] = cookie["bili_jct"]
+    if cookie.get("DedeUserID"):
+        creds["bili_uid"] = cookie["DedeUserID"]
+
+    want = ["bili_access_key", "bili_csrf", "bili_sessdata",
+            "bili_jct", "bili_uid"]
+    missing = [k for k in want if not creds.get(k)]
+    return {"creds": creds, "source_api": source_api, "missing": missing}
+
+
+def import_har_credentials(har_text: str) -> dict:
+    """解析 HAR 并落盘保存。返回 save 视图 + 来源接口。"""
+    parsed = parse_har_credentials(har_text)
+    if parsed.get("error"):
+        return parsed
+    if not parsed["creds"]:
+        return {"error": "HAR 中未找到任何凭证(access_key/Cookie 均缺)",
+                "missing": parsed["missing"]}
+    view = save_credentials(parsed["creds"], source="HAR上传")
+    view["source_api"] = parsed["source_api"]
+    view["missing"] = parsed["missing"]
+    view["updated_fields"] = sorted(parsed["creds"].keys())
+    return view

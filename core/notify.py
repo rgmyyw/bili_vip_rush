@@ -4,8 +4,15 @@
 原则：通知永远不能影响抢购主流程——未配置时静默跳过，发送失败只记
 日志事件并返回 False。
 """
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import time
+import urllib.parse
+
+import requests
 import os
 import smtplib
 from datetime import datetime
@@ -24,6 +31,7 @@ REASON_TEXT = {
     "max_attempts": "达到重试上限",
     "timeout": "超时未抢到",
     "crashed": "运行异常",
+    "risk_control": "触发风控已停抢",
 }
 
 
@@ -49,6 +57,10 @@ def reload_notify_into_settings():
         "BILI_SMTP_USER", "SMTP_USER", "user") or ""
     settings_mod.SMTP_PASS = settings_mod._cred(
         "BILI_SMTP_PASS", "SMTP_PASS", "pass") or ""
+    settings_mod.DINGTALK_WEBHOOK = settings_mod._cred(
+        "BILI_DINGTALK_WEBHOOK", "DINGTALK_WEBHOOK", "dingtalk_webhook") or ""
+    settings_mod.DINGTALK_SECRET = settings_mod._cred(
+        "BILI_DINGTALK_SECRET", "DINGTALK_SECRET", "dingtalk_secret") or ""
     settings_mod.NOTIFY_TO = (
         settings_mod._cred("BILI_NOTIFY_TO", "NOTIFY_TO", "to")
         or settings_mod.SMTP_USER)
@@ -72,11 +84,15 @@ def notify_config_view() -> dict:
         "user": settings.SMTP_USER,
         "to": settings.NOTIFY_TO,
         "pass_set": bool(settings.SMTP_PASS),
+        "dingtalk_webhook": (settings.DINGTALK_WEBHOOK or "")[:60],
+        "dingtalk_set": bool(settings.DINGTALK_WEBHOOK),
         "sources": {
             "host": _field_source("BILI_SMTP_HOST", "host"),
             "user": _field_source("BILI_SMTP_USER", "user"),
             "pass": _field_source("BILI_SMTP_PASS", "pass"),
             "to": _field_source("BILI_NOTIFY_TO", "to"),
+            "dingtalk": _field_source("BILI_DINGTALK_WEBHOOK",
+                                      "dingtalk_webhook"),
         },
     }
 
@@ -87,6 +103,8 @@ _FORM_FIELDS = {
     "user": "BILI_SMTP_USER",
     "pass": "BILI_SMTP_PASS",
     "to": "BILI_NOTIFY_TO",
+    "dingtalk_webhook": "BILI_DINGTALK_WEBHOOK",
+    "dingtalk_secret": "BILI_DINGTALK_SECRET",
 }
 
 
@@ -108,7 +126,8 @@ def save_notify_config(cfg: dict) -> dict:
     if not isinstance(merged, dict):
         merged = {}
 
-    for key in ("host", "port", "user", "pass", "to"):
+    for key in ("host", "port", "user", "pass", "to",
+                "dingtalk_webhook", "dingtalk_secret"):
         val = cfg.get(key)
         if val is None:
             continue                      # 未提交：保持现状
@@ -142,6 +161,11 @@ def send_mail(subject: str, body: str) -> bool:
         else:
             server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT,
                                   timeout=15)
+            # 587 等端口必须先 STARTTLS 再登录（QQ 邮箱强制，明文直接被断开）
+            try:
+                server.starttls()
+            except smtplib.SMTPNotSupportedError:
+                pass   # 服务器不支持 TLS 时退回明文（部分内网中继）
         try:
             server.login(settings.SMTP_USER, settings.SMTP_PASS)
             server.sendmail(settings.SMTP_USER, [settings.NOTIFY_TO],
@@ -195,4 +219,38 @@ def notify_rush_result(result: dict) -> bool:
             f"时间: {now}\n"
             f"复盘: python tools/replay.py {result.get('log_file', '')}\n"
         )
+    # 抢购结果双通道:邮件 + 钉钉(成功通知有支付时效,IM 即达;
+    # 未配置钉钉时静默跳过,不影响邮件)
+    send_dingtalk(f"{subject}\n{body}")
     return send_mail(subject, body)
+
+
+def send_dingtalk(text: str) -> bool:
+    """钉钉机器人推送（加签模式）。未配置 webhook 返回 False；
+    任何失败不抛异常。"""
+    webhook = (settings.DINGTALK_WEBHOOK or "").strip()
+    if not webhook:
+        return False
+    url = webhook
+    secret = (settings.DINGTALK_SECRET or "").strip()
+    if secret:
+        ts = str(round(time.time() * 1000))
+        digest = hmac.new(secret.encode("utf-8"),
+                          f"{ts}\n{secret}".encode("utf-8"),
+                          hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(digest))
+        url = f"{webhook}&timestamp={ts}&sign={sign}"
+    try:
+        resp = requests.post(url, timeout=8,
+                             json={"msgtype": "text", "text": {"content": text}})
+        return bool(resp.json().get("errcode") == 0)
+    except Exception as ex:
+        logger.warning("钉钉推送失败(不影响主流程): %s", ex)
+        return False
+
+
+def notify_all(subject: str, body: str) -> dict:
+    """邮件+钉钉双通道推送。返回各通道结果。"""
+    mail_ok = send_mail(subject, body) if notify_enabled() else False
+    ding_ok = send_dingtalk(f"{subject}\n{body}")
+    return {"mail": mail_ok, "dingtalk": ding_ok}
