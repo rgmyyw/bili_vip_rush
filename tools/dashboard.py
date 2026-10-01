@@ -93,6 +93,39 @@ def refresh_cred(max_age_s: float = 120.0) -> str:
     return state
 
 
+# ---------------------------------------------------------------- 账号资料
+_profile_lock = threading.Lock()
+_profile = {"ts": 0.0, "data": {}}
+
+
+def refresh_profile(max_age_s: float = 600.0) -> dict:
+    """当前账号头像/昵称(myinfo),缓存 10 分钟;失败返回上一次缓存。"""
+    import time as _time
+    with _profile_lock:
+        if _profile["data"].get("name") and \
+                _time.time() - _profile["ts"] < max_age_s:
+            return dict(_profile["data"])
+    from core.auth import reload_credentials_into_settings
+    from core.client import BiliClient
+    from core.run_logger import NullRunLogger
+    reload_credentials_into_settings()
+    client = BiliClient(run_logger=NullRunLogger(), timeout=8)
+    client.phase = "credcheck"
+    try:
+        d = client._request("GET", settings.URL_MY_INFO)
+        data = {
+            "mid": d.get("mid"),
+            "name": str(d.get("name") or ""),
+            "face": str(d.get("face") or "").replace("http://", "https://"),
+            "level": (d.get("level") or -6),
+        }
+    except Exception as ex:
+        data = dict(_profile["data"]) or {"error": str(ex)[:120]}
+    with _profile_lock:
+        _profile.update(ts=_time.time(), data=data)
+    return dict(data)
+
+
 # ---------------------------------------------------------------- HTTP 服务
 PAGE = """<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
@@ -354,6 +387,13 @@ async function refreshCred(){
   st.textContent = complete ? "已配置" : "不完整";
   st.className = "tag " + (complete ? "success" : "credential_expired");
   const src = c.sources || {};
+  j("/api/profile").then(p => {
+    if (!p.name) return;
+    const esc = p.name.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    document.getElementById("csummary").innerHTML =
+      "<img src='" + p.face + "' alt='' style='width:22px;height:22px;border-radius:50%;vertical-align:middle;margin-right:6px'>" +
+      esc + " <span class='muted'>(" + p.mid + ")</span>";
+  }).catch(() => {});
   document.getElementById("csummary").textContent =
     `UID ${c.uid} · access_key ${c.set.access_key ? c.access_key + "(" + src.access_key + ")" : "未设"} · SESSDATA ${c.set.sessdata ? "(" + src.sessdata + ")" : "未设"}` +
     (c.updated_at ? ` · 更新于 ${c.updated_at}(${c.updated_by})` : "");
@@ -475,6 +515,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(out)
             except Exception as ex:
                 return self._json({"error": f"保存失败: {ex}"[:200]}, 500)
+        if path == "/api/profile":
+            self._json(refresh_profile())
+            return
         if path == "/api/reserve":
             # 一键预约(手动触发):reserve 按场次有效,-400 等业务态
             # 响应原样返回,由前端结合 isReserved 复核展示
@@ -531,6 +574,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif path == "/api/profile":
+            self._json(refresh_profile())
         elif path == "/api/summary":
             out = refresh_live()
             out["cred"] = refresh_cred()
