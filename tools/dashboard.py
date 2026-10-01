@@ -391,7 +391,7 @@ async function refreshCred(){
     if (!p.name) return;
     const esc = p.name.replace(/</g, "&lt;").replace(/>/g, "&gt;");
     document.getElementById("csummary").innerHTML =
-      "<img src='" + p.face + "' alt='' style='width:22px;height:22px;border-radius:50%;vertical-align:middle;margin-right:6px'>" +
+      "<img src='" + p.face + "' alt='' referrerpolicy='no-referrer' style='width:22px;height:22px;border-radius:50%;vertical-align:middle;margin-right:6px'>" +
       esc + " <span class='muted'>(" + p.mid + ")</span>";
   }).catch(() => {});
   document.getElementById("csummary").textContent =
