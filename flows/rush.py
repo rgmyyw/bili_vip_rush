@@ -263,7 +263,7 @@ class RushFlow:
                 # 指定 early_seconds 时生效；重算等待点后重新进循环
                 if (settings.RUSH_EARLY_ADAPTIVE and worst is not None
                         and early_seconds is None):
-                    early = min(2.2, max(1.8, worst * 2 + 0.15))
+                    early = min(1.2, max(0.8, worst * 2 + 0.15))
                     wait_until = target_ts - early
                     self._record("early_adjusted", early_s=round(early, 3),
                                  measured_rtt_ms=round(worst * 1000))
