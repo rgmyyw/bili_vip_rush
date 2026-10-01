@@ -62,7 +62,13 @@ def phase_pacing(sale_s: float) -> tuple:
             return (1.0, True, False)     # 黄金窗:全速豁免
         if sale_s >= settings.RUSH_TAIL_FROM:
             return (settings.RUSH_TAIL_DENSITY, False, False)
-        return (1.0, False, False)        # 提前窗/回落段:常规+自适应节流
+        if sale_s < 0:
+            # 探测段(开售前):低频探测密度(300ms 级),配合 worker 隔离
+            # ——仅 worker-0 发请求,频控信用留给开闸瞬间
+            dens = (getattr(settings, "RUSH_PROBE_INTERVAL", 0.3)
+                    / settings.RUSH_BURST_INTERVAL)
+            return (dens, False, False)
+        return (1.0, False, False)        # 回落段:常规+自适应节流
     except Exception:   # 配置缺失/类型异常:退化为常规节奏,绝不因分段崩
         logging.getLogger(__name__).exception(
             "phase_pacing 分段判定异常,退化常规节奏 sale_s=%s", sale_s)
@@ -374,6 +380,18 @@ class RushFlow:
         sold_out_at = None
         syserr_streak = 0
         while not stop_event.is_set() and time.monotonic() < deadline:
+            # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
+            # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
+            if worker_id != 0:
+                sale_now = ((time.monotonic() - rush_t0)
+                            - getattr(self, "_lead_s", 0.0))
+                if sale_now < 0:
+                    if -sale_now > 0.05:
+                        time.sleep(min(-sale_now - 0.05, 0.2))
+                        continue
+                    while ((time.monotonic() - rush_t0)
+                           - getattr(self, "_lead_s", 0.0)) < 0:
+                        pass   # 忙等:开售瞬间毫秒级进场
             with counter["lock"]:
                 counter["n"] += 1
                 attempt = counter["n"]

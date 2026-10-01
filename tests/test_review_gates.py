@@ -197,8 +197,9 @@ def test_throttle_backoff_grows_with_702_rate(monkeypatch):
 def test_phase_pacing_windows():
     """黄金窗豁免全速;尾段降密度;开售 10s 收兵。"""
     from flows.rush import phase_pacing
-    assert phase_pacing(-2.0) == (1.0, False, False)   # 提前窗:常规+节流
-    assert phase_pacing(-0.3) == (1.0, True, False)    # 黄金窗:豁免全速
+    d, e, st = phase_pacing(-2.0)   # 探测段:低频密度(300ms 级)
+    assert d > 5 and e is False and st is False
+    assert phase_pacing(-0.02) == (1.0, True, False)   # 黄金窗:豁免全速
     assert phase_pacing(0.5) == (1.0, True, False)
     assert phase_pacing(0.9) == (1.0, False, False)    # 回落段
     assert phase_pacing(3.0)[0] > 1.0                  # 尾段:降密度
