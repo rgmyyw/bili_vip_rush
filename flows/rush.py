@@ -265,15 +265,21 @@ class RushFlow:
                             self._worker_clients))
                     finally:
                         pool.shutdown(wait=True)
-                    vals = [t for t in times if t is not None]
-                    worst = max(vals) if vals else None
+                    vals = sorted(t for t in times if t is not None)
+                    worst = vals[-1] if vals else None
                 except Exception:   # 线程池整体失败:降级为不预热裸打
                     logger.exception("并发预热整体失败,降级裸连(不影响开抢)")
                     worst = None
+                    vals = []
                 self._record(
                     "prewarm", workers=n_workers,
                     ok=bool(worst is not None),
-                    worst_ms=round(worst * 1000) if worst else None)
+                    worst_ms=round(worst * 1000) if worst else None,
+                    # 分路预热耗时分布:复盘可定位慢连接/坏路
+                    rtt_min_ms=round(vals[0] * 1000) if vals else None,
+                    rtt_p50_ms=round(vals[len(vals) // 2] * 1000)
+                    if vals else None,
+                    rtt_all_ms=[round(v * 1000) for v in vals])
                 logger.info("连接预热 %s（%s 路）",
                             f"实测 {worst * 1000:.0f}ms" if worst else "失败(忽略)",
                             n_workers)
@@ -640,6 +646,11 @@ class RushFlow:
                     counter["win_rate"] = (counter["win_702"]
                                            / counter["win_total"])
                     counter["win_total"] = counter["win_702"] = 0
+                    # 节流留痕:每个统计窗口一条,复盘时还原节奏变化原因
+                    self._record("throttle_state",
+                                 win_rate=round(counter["win_rate"], 2),
+                                 streak702=counter.get("streak702", 0),
+                                 attempts=counter["n"])
                 rate = counter.get("win_rate", 0.0)
             extra = 0.0 if exempt else settings.RUSH_THROTTLE_MAX_S * rate
             base_sleep = next_interval(attempt, elapsed, interval) * dens
