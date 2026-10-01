@@ -168,7 +168,10 @@ ALLOWED_PANEL_TYPES = {"26moe_cdd178"}
 RUSH_EARLY_SECONDS = 0.1      # 提前量:11:59:59.9 起以 3 路轻探测,12:00:00 整 60 路全压
 RUSH_EARLY_ADAPTIVE = True    # 按预热实测往返自适应提前量(0.08~0.15s)
 RUSH_CONCURRENCY = 60         # 60路=开闸瞬间60发全部在途;每路1发/秒(最温和单连接节奏)
-RUSH_TARGET_RPS = 60.0        # 总速 60 发/秒=每路1发/秒,恰贴频控线(60发阈值)
+RUSH_TARGET_RPS = 55.0        # 总弹药 55 发(留 5 发余量防频控线波动)
+RUSH_VOLLEY_1 = 35            # 第一波 35 路押 12:00:00.00(拼准点)
+RUSH_VOLLEY_2 = 15            # 第二波 15 路:开闸信号驱动,兜底 +0.30s;worker-0 为哨兵(100ms 盯梢)
+RUSH_VOLLEY2_FALLBACK = 0.30  # 第二波定时兜底延迟(秒);开闸信号先到先发
 PREWARM_CONNECTIONS = 2       # 每路预热连接数(填连接池,防单连接偶发失败)
 RUSH_BURST_COUNT = 8          # 前 N 次为爆发段
 RUSH_BURST_INTERVAL = 0.04    # 爆发段间隔（秒）

@@ -394,16 +394,24 @@ class RushFlow:
         while not stop_event.is_set() and time.monotonic() < deadline:
             # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
             # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
-            if worker_id >= 1:   # 仅 worker-0 单路探测,其余 59 路休眠等爆发
+            volley1 = max(1, int(getattr(settings, "RUSH_VOLLEY_1", 40)))
+            if worker_id >= 1:
+                # 双波齐射:worker 1..volley1 押 12:00:00.00(定时点进);
+                # worker volley1.. 属第二波——开闸信号(burst)先到先发,
+                # 否则定时兜底 +0.30s(防开闸延迟,弹药不烧在关着的大门)
                 sale_now = ((time.monotonic() - rush_t0)
                             - getattr(self, "_lead_s", 0.0))
-                if sale_now < 0 and not counter["burst"].is_set():
-                    if -sale_now > 0.05:
-                        time.sleep(min(-sale_now - 0.05, 0.2))
+                if worker_id < volley1:
+                    gate = 0.0
+                else:
+                    gate = getattr(settings, "RUSH_VOLLEY2_FALLBACK", 0.30)
+                if sale_now < gate and not counter["burst"].is_set():
+                    if gate - sale_now > 0.05:
+                        time.sleep(min(gate - sale_now - 0.05, 0.2))
                         continue
-                    # 末段忙等:到点或收到开闸信号(burst)即进场
+                    # 末段忙等:越过波门或收到开闸信号即进场
                     while (((time.monotonic() - rush_t0)
-                            - getattr(self, "_lead_s", 0.0)) < 0
+                            - getattr(self, "_lead_s", 0.0)) < gate
                            and not counter["burst"].is_set()):
                         pass
             with counter["lock"]:
@@ -491,7 +499,7 @@ class RushFlow:
                     if (ex.code not in (69422, 43055, -702)
                             and not counter["burst"].is_set()
                             and ((time.monotonic() - rush_t0)
-                                 - getattr(self, "_lead_s", 0.0)) < 0):
+                                 - getattr(self, "_lead_s", 0.0)) < 0.5):
                         counter["burst"].set()
                         self._record("burst_signal", code=ex.code,
                                      worker=worker_id)
@@ -582,8 +590,13 @@ class RushFlow:
                     counter["win_total"] = counter["win_702"] = 0
                 rate = counter.get("win_rate", 0.0)
             extra = 0.0 if exempt else settings.RUSH_THROTTLE_MAX_S * rate
-            time.sleep(next_interval(attempt, elapsed, interval) * dens
-                       + extra)
+            base_sleep = next_interval(attempt, elapsed, interval) * dens
+            # 哨兵:worker-0 在开售前后 0.5s 窗口内以 100ms 盯梢
+            # (高频捕捉开闸码突变,拉响第二波;消耗 ~5 发额度)
+            if (worker_id == 0 and not counter["burst"].is_set()
+                    and -0.15 < sale_s < 0.5):
+                base_sleep = 0.1
+            time.sleep(base_sleep + extra)
         with counter["lock"]:
             first_timeout = not counter["timed_out"]
             counter["timed_out"] = True
