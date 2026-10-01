@@ -199,10 +199,11 @@ def test_phase_pacing_windows():
     from flows.rush import phase_pacing
     d, e, st = phase_pacing(-2.0)   # 探测段:低频密度(300ms 级)
     assert d > 5 and e is False and st is False
-    assert phase_pacing(-0.02) == (1.0, True, False)   # 黄金窗:豁免全速
-    assert phase_pacing(0.5) == (1.0, True, False)
+    for t in (-0.02, 0.5):
+        d, e, st = phase_pacing(t)   # 黄金窗:贴线密度(>=4)+豁免节流
+        assert e is True and st is False and d >= 4
     assert phase_pacing(0.9) == (1.0, False, False)    # 回落段
-    assert phase_pacing(3.0)[0] > 1.0                  # 尾段:降密度
+    assert phase_pacing(3.0)[0] >= 12                  # 尾段:低密度(~20发/秒)
     dens, _, stop = phase_pacing(10.0)
     assert stop is True                                # 到点收兵
 
