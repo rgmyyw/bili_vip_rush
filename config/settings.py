@@ -186,7 +186,11 @@ RUSH_PROBE_INTERVAL = 0.3     # 探测-爆发:开售前仅 worker-0 以此间隔
                                # 探测(~3发),其余路休眠到开售瞬间满血爆发
 RUSH_PEAK_TO = 0.8            # 黄金窗终点(开售后0.8s)
 RUSH_TAIL_FROM = 2.0          # 尾段起点(降密度扫尾,捡锁单释放回流)
-RUSH_TAIL_DENSITY = 3.0       # 尾段间隔倍率
+RUSH_PEAK_DENSITY = 4.5       # 黄金窗贴线密度:10路x(40ms*4.5)=55发/秒
+                               # ≈账号频控阈值(60发),整个窗口每发有效;
+                               # 全速250发/秒0.24s烧完额度后哑火10s(10-01实证)
+RUSH_TAIL_DENSITY = 12.0      # 尾段间隔倍率(~20发/秒低密度;频控惩罚期
+                               # >10s,高密度纯浪费额度)
 RUSH_TAIL_STOP_S = 10.0       # 开售后 N 秒主动收兵(66名额早尽,继续打只烧频控)
 RUSH_DURATION_SECONDS = 14.0  # 总时长兜底(提前2s+黄金+尾段)
 RUSH_THROTTLE_WINDOW = 30     # 节流判定窗口(最近 N 发)

@@ -59,7 +59,7 @@ def phase_pacing(sale_s: float) -> tuple:
         if sale_s >= settings.RUSH_TAIL_STOP_S:
             return (0.0, False, True)
         if settings.RUSH_PEAK_FROM <= sale_s <= settings.RUSH_PEAK_TO:
-            return (1.0, True, False)     # 黄金窗:全速豁免
+            return (getattr(settings, "RUSH_PEAK_DENSITY", 4.5), True, False)  # 黄金窗:贴线密度(55发/秒≈频控阈值60发)
         if sale_s >= settings.RUSH_TAIL_FROM:
             return (settings.RUSH_TAIL_DENSITY, False, False)
         if sale_s < 0:
