@@ -65,7 +65,10 @@ def phase_pacing(sale_s: float) -> tuple:
                        * settings.RUSH_BURST_INTERVAL))
             return (dens, True, False)
         if sale_s >= settings.RUSH_TAIL_FROM:
-            return (settings.RUSH_TAIL_DENSITY, False, False)
+            # 尾段目标 ~20 发/秒,dens 按路数换算(固定 12 在 60 路下=125/秒超频)
+            dens = (max(1, int(settings.RUSH_CONCURRENCY))
+                    / (20.0 * settings.RUSH_BURST_INTERVAL))
+            return (dens, False, False)
         if sale_s < 0:
             # 探测段(开售前):低频探测密度(300ms 级),配合 worker 隔离
             # ——仅 worker-0 发请求,频控信用留给开闸瞬间
