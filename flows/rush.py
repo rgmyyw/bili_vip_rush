@@ -309,11 +309,17 @@ class RushFlow:
         clients = list(self._worker_clients or [])
         if not clients:
             clients = [self.client]
-            for i in range(n_workers - 1):
-                try:
-                    clients.append(self._spawn_client())
-                except Exception:   # 单路创建失败:跳过该路,不废整轮
-                    logger.exception("worker-%s client 创建失败,跳过", i + 1)
+            if isinstance(self.client, BiliClient):
+                for i in range(n_workers - 1):
+                    try:
+                        clients.append(self._spawn_client())
+                    except Exception:   # 单路创建失败:跳过该路,不废整轮
+                        logger.exception("worker-%s client 创建失败,跳过",
+                                         i + 1)
+            else:
+                # 测试 mock 客户端:共享同一实例(避免 spawn 真实
+                # BiliClient 发实际网络请求污染测试与外部接口)
+                clients += [self.client] * (n_workers - 1)
         if len(clients) <= 1:
             return self._rush_attempts(deadline, total, rush_t0, stop_event,
                                        counter, self.client, 0, interval)

@@ -230,15 +230,27 @@ def test_spawn_failure_skips_only_that_worker(pause_file, monkeypatch):
     from core.pause import set_paused
     set_paused(False)
 
-    flow = _bare_flow([dict(PLAN_OK)], _mk_client({"order_no": "OK-S"}))
+    from core.client import BiliClient
+    real = BiliClient(run_logger=NullRunLogger(), timeout=1)
+    real.get_server_time = lambda: int(_t.time())
+    real.get_attract_card = lambda: {"next_open_at": int(_t.time()) + 3600}
+    real.create_order = lambda plan: {"order_no": "OK-S"}
+    real.pay_link = lambda p: "http://p"
+    real.get_order_status = lambda o: {"status": 1}
+    flow = _bare_flow([dict(PLAN_OK)], real)
     flow._worker_clients = []
     calls = {"n": 0}
-    orig = flow._spawn_client
     def bad_spawn():
         calls["n"] += 1
         if calls["n"] == 1:
             raise OSError("cannot alloc")
-        return _mk_client({"order_no": "OK-S"})
+        c = BiliClient(run_logger=NullRunLogger(), timeout=1)
+        c.get_server_time = real.get_server_time
+        c.get_attract_card = real.get_attract_card
+        c.create_order = real.create_order
+        c.pay_link = real.pay_link
+        c.get_order_status = real.get_order_status
+        return c
     flow._spawn_client = bad_spawn
     order = flow.rush(target_ts=_t.time() - 1, duration=1.0)
     assert order and order["order_no"] == "OK-S"   # 少一路仍成功
