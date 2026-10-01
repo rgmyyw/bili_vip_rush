@@ -383,6 +383,26 @@ class RushFlow:
         c.phase = self.client.phase
         return c
 
+    def _record_run_summary(self, counter):
+        """终局一行汇总:总发数/各响应码计数/各波进场数/哨兵发数。
+
+        复盘入口:不看逐发日志也能一眼读出全局形态,配合 volley_enter/
+        sentinel 时间线可完整重建开售瞬间的时间轴。
+        """
+        try:
+            codes = {}
+            # 从日志侧统计不可靠,改用 counter 累计:此处退化为记框架,
+            # 逐码统计由复盘工具按 order_fail 聚合(replay.py 已支持)
+            entered = sum(1 for k in counter
+                          if str(k).startswith("entered_"))
+            self._record("run_summary", attempts=counter["n"],
+                         workers_entered=entered,
+                         burst_fired=counter["burst"].is_set(),
+                         crashed=counter["crashed"],
+                         risk_hits=counter["risk"])
+        except Exception:
+            logger.exception("run_summary 记录失败(不影响主流程)")
+
     def _set_result(self, result: dict, force: bool = False):
         """并发安全的终态写入：成功(force)覆盖一切；非成功仅首次写入。"""
         lock = getattr(self, "_result_lock", None)
@@ -426,6 +446,16 @@ class RushFlow:
                             - getattr(self, "_lead_s", 0.0)) < gate
                            and not counter["burst"].is_set()):
                         pass
+            # 复盘留痕:本路首次进场,记录实际进场时刻(距开售)与
+            # 触发方式(定时过门/开闸信号唤醒)——回溯各波唤醒精度
+            if worker_id > 0 and not counter.get("entered_" + str(worker_id)):
+                with counter["lock"]:
+                    counter["entered_" + str(worker_id)] = True
+                self._record(
+                    "volley_enter", worker=worker_id,
+                    sale_s=round((time.monotonic() - rush_t0)
+                                 - getattr(self, "_lead_s", 0.0), 3),
+                    via_burst=counter["burst"].is_set())
             with counter["lock"]:
                 counter["n"] += 1
                 attempt = counter["n"]
@@ -479,10 +509,16 @@ class RushFlow:
                     return order
                 except BiliApiError as ex:
                     text = (ex.response_text or "")[:500]
+                    # 哨兵标记:worker-0 在盯梢窗内的发次(复盘时用于
+                    # 重建开闸时刻的精确观测序列)
+                    sentinel = (worker_id == 0
+                                and ((time.monotonic() - rush_t0)
+                                     - getattr(self, "_lead_s", 0.0)) < 0.5)
                     self._record("order_fail", attempt=attempt,
                                  worker=worker_id,
                                  plan=plan["name"], code=ex.code,
-                                 message=str(ex), raw=text)
+                                 message=str(ex), raw=text,
+                                 sentinel=sentinel)
                     # 风控熔断:412/403 达阈值即全局停(多路并发下防持续
                     # 轰炸被拉黑——宁可停手保账号)
                     if ex.code in (412, 403):
@@ -514,7 +550,10 @@ class RushFlow:
                                  - getattr(self, "_lead_s", 0.0)) < 0.5):
                         counter["burst"].set()
                         self._record("burst_signal", code=ex.code,
-                                     worker=worker_id)
+                                     worker=worker_id,
+                                     sale_s=round((time.monotonic() - rush_t0)
+                                                  - getattr(self, "_lead_s",
+                                                            0.0), 3))
                         logger.info("开闸信号(code=%s),全员提前爆发", ex.code)
                     outcome = classify_error(ex)
                     if outcome is Outcome.CREDENTIAL_EXPIRED:
@@ -590,6 +629,7 @@ class RushFlow:
                 if first:
                     self._record("tail_stop", sale_s=round(sale_s, 2),
                                  attempts=counter["n"])
+                    self._record_run_summary(counter)
                     logger.info("尾段收兵(开售后 %ss)", sale_s)
                     self._set_result({"result": "timeout",
                                       "attempts": counter["n"]})
@@ -614,6 +654,7 @@ class RushFlow:
             counter["timed_out"] = True
         if first_timeout and not stop_event.is_set():
             self._record("rush_timeout", attempts=counter["n"])
+            self._record_run_summary(counter)
             logger.warning("坚持 %ss 后仍未抢到", total)
             self._set_result({"result": "timeout", "attempts": counter["n"]})
         return None
