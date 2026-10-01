@@ -172,7 +172,7 @@ RUSH_TARGET_RPS = 60.0        # 总速 60 发/秒=每路1发/秒,恰贴频控线
 PREWARM_CONNECTIONS = 2       # 每路预热连接数(填连接池,防单连接偶发失败)
 RUSH_BURST_COUNT = 8          # 前 N 次为爆发段
 RUSH_BURST_INTERVAL = 0.04    # 爆发段间隔（秒）
-RUSH_WAVE_DELAYS = (0.0, 0.06, 0.12)  # 阶梯相位密化:黄金窗仅1.3s,10路须全在场均匀铺开
+RUSH_WAVE_DELAYS = (0.0,)      # 零延迟:60 路 12:00:00 齐射(每路1发/秒,无需错峰)
 RUSH_FAST_WINDOW = 10.0       # 开售后 N 秒内为快速段
 RUSH_FAST_INTERVAL = 0.12     # 快速段间隔
 RUSH_SLOW_INTERVAL = 0.30     # 慢速段间隔

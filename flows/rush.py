@@ -388,7 +388,7 @@ class RushFlow:
         while not stop_event.is_set() and time.monotonic() < deadline:
             # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
             # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
-            if worker_id >= 3:   # 探测路=worker 0-2(3路轻探),其余休眠
+            if worker_id >= 1:   # 仅 worker-0 单路探测,其余 59 路休眠等爆发
                 sale_now = ((time.monotonic() - rush_t0)
                             - getattr(self, "_lead_s", 0.0))
                 if sale_now < 0 and not counter["burst"].is_set():
