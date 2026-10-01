@@ -292,7 +292,9 @@ class RushFlow:
                      prewarmed=prewarmed, workers=n_workers, lead_s=early)
 
         counter = {"lock": threading.Lock(), "n": 0, "timed_out": False,
-                   "risk": 0, "crashed": 0, "win_total": 0, "win_702": 0, "win_rate": 0.0}
+                   "risk": 0, "crashed": 0, "win_total": 0, "win_702": 0,
+                   "win_rate": 0.0,
+                   "burst": threading.Event()}
         stop_event = threading.Event()
         self._result_lock = threading.Lock()
         deadline = time.monotonic() + total
@@ -385,13 +387,15 @@ class RushFlow:
             if worker_id != 0:
                 sale_now = ((time.monotonic() - rush_t0)
                             - getattr(self, "_lead_s", 0.0))
-                if sale_now < 0:
+                if sale_now < 0 and not counter["burst"].is_set():
                     if -sale_now > 0.05:
                         time.sleep(min(-sale_now - 0.05, 0.2))
                         continue
-                    while ((time.monotonic() - rush_t0)
-                           - getattr(self, "_lead_s", 0.0)) < 0:
-                        pass   # 忙等:开售瞬间毫秒级进场
+                    # 末段忙等:到点或收到开闸信号(burst)即进场
+                    while (((time.monotonic() - rush_t0)
+                            - getattr(self, "_lead_s", 0.0)) < 0
+                           and not counter["burst"].is_set()):
+                        pass
             with counter["lock"]:
                 counter["n"] += 1
                 attempt = counter["n"]
@@ -472,6 +476,16 @@ class RushFlow:
                             counter["streak702"] = counter.get("streak702", 0) + 1
                         else:
                             counter["streak702"] = 0
+                    # 开闸信号:开售前探测期收到非常规码(非未开售69422/
+                    # 非拥挤43055/非频控-702)=状态突变即开闸,广播全员爆发
+                    if (ex.code not in (69422, 43055, -702)
+                            and not counter["burst"].is_set()
+                            and ((time.monotonic() - rush_t0)
+                                 - getattr(self, "_lead_s", 0.0)) < 0):
+                        counter["burst"].set()
+                        self._record("burst_signal", code=ex.code,
+                                     worker=worker_id)
+                        logger.info("开闸信号(code=%s),全员提前爆发", ex.code)
                     outcome = classify_error(ex)
                     if outcome is Outcome.CREDENTIAL_EXPIRED:
                         self._record("stop_reason",
