@@ -273,7 +273,7 @@ class RushFlow:
                 # 指定 early_seconds 时生效；重算等待点后重新进循环
                 if (settings.RUSH_EARLY_ADAPTIVE and worst is not None
                         and early_seconds is None):
-                    early = min(0.6, max(0.4, worst * 2 + 0.15))
+                    early = min(0.15, max(0.08, worst * 2 + 0.15))
                     wait_until = target_ts - early
                     self._record("early_adjusted", early_s=round(early, 3),
                                  measured_rtt_ms=round(worst * 1000))
@@ -388,7 +388,7 @@ class RushFlow:
         while not stop_event.is_set() and time.monotonic() < deadline:
             # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
             # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
-            if worker_id != 0:
+            if worker_id >= 3:   # 探测路=worker 0-2(3路轻探),其余休眠
                 sale_now = ((time.monotonic() - rush_t0)
                             - getattr(self, "_lead_s", 0.0))
                 if sale_now < 0 and not counter["burst"].is_set():
