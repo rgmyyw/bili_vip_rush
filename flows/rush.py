@@ -72,7 +72,12 @@ def phase_pacing(sale_s: float) -> tuple:
             dens = (getattr(settings, "RUSH_PROBE_INTERVAL", 0.3)
                     / settings.RUSH_BURST_INTERVAL)
             return (dens, False, False)
-        return (1.0, False, False)        # 回落段:常规+自适应节流
+        # 回落段:保持总速贴线(dens 与黄金窗同换算)——60 路 40ms 的
+        # 全密度会在该段理论打出 600+ 发/秒,首轮即冲爆频控额度
+        dens = (max(1, int(settings.RUSH_CONCURRENCY))
+                / (getattr(settings, "RUSH_TARGET_RPS", 55.0)
+                   * settings.RUSH_BURST_INTERVAL))
+        return (dens, False, False)        # 回落段:匀速贴线+自适应节流
     except Exception:   # 配置缺失/类型异常:退化为常规节奏,绝不因分段崩
         logging.getLogger(__name__).exception(
             "phase_pacing 分段判定异常,退化常规节奏 sale_s=%s", sale_s)
@@ -394,20 +399,24 @@ class RushFlow:
         while not stop_event.is_set() and time.monotonic() < deadline:
             # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
             # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
-            volley1 = max(1, int(getattr(settings, "RUSH_VOLLEY_1", 40)))
+            volley1 = max(1, int(getattr(settings, "RUSH_VOLLEY_1", 35)))
+            volley2 = max(0, int(getattr(settings, "RUSH_VOLLEY_2", 15)))
             if worker_id >= 1:
-                # 双波齐射:worker 1..volley1 押 12:00:00.00(定时点进);
-                # worker volley1.. 属第二波——开闸信号(burst)先到先发,
-                # 否则定时兜底 +0.30s(防开闸延迟,弹药不烧在关着的大门)
-                sale_now = ((time.monotonic() - rush_t0)
-                            - getattr(self, "_lead_s", 0.0))
+                # 三段门:worker 1..volley1-1 第一波押 12:00:00.00;
+                # volley1..volley1+volley2-1 第二波(开闸信号先到先发,
+                # 兜底 +0.30s);其余为余量路(+1.0s 匀速捡漏)
                 if worker_id < volley1:
                     gate = 0.0
-                else:
+                elif worker_id < volley1 + volley2:
                     gate = getattr(settings, "RUSH_VOLLEY2_FALLBACK", 0.30)
+                else:
+                    gate = 1.0
+                sale_now = ((time.monotonic() - rush_t0)
+                            - getattr(self, "_lead_s", 0.0))
                 if sale_now < gate and not counter["burst"].is_set():
                     if gate - sale_now > 0.05:
-                        time.sleep(min(gate - sale_now - 0.05, 0.2))
+                        # 短睡片:开闸信号到达后最多 50ms 即可进场
+                        time.sleep(min(gate - sale_now - 0.05, 0.05))
                         continue
                     # 末段忙等:越过波门或收到开闸信号即进场
                     while (((time.monotonic() - rush_t0)
@@ -558,8 +567,8 @@ class RushFlow:
             elapsed = time.monotonic() - rush_t0
             # 时间分段火力 + -702 自适应节流(任何计算异常退化为保守
             # 1s 间隔继续打,本路绝不因节奏计算退出)
+            sale_s = elapsed - getattr(self, "_lead_s", 0.0)  # 距开售
             try:
-                sale_s = elapsed - getattr(self, "_lead_s", 0.0)  # 距开售
                 dens, exempt, stop_now = phase_pacing(sale_s)
                 # 频控硬上限:连续 50 发 -702 后黄金窗豁免失效
                 # (开售若不放行频控,全速=全拒=零命中,恢复节流贴线)

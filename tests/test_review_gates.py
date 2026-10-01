@@ -202,7 +202,8 @@ def test_phase_pacing_windows():
     for t in (-0.02, 0.5):
         d, e, st = phase_pacing(t)   # 黄金窗:贴线密度(>=4)+豁免节流
         assert e is True and st is False and d >= 4
-    assert phase_pacing(0.9) == (1.0, False, False)    # 回落段
+    d, e, st = phase_pacing(0.9)   # 回落段:总速匀速贴线(防 60 路全密度冲爆额度)
+    assert e is False and st is False and d >= 10
     assert phase_pacing(3.0)[0] >= 12                  # 尾段:低密度(~20发/秒)
     dens, _, stop = phase_pacing(10.0)
     assert stop is True                                # 到点收兵
