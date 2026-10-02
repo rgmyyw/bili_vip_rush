@@ -3,6 +3,8 @@
 import json
 from unittest import mock
 
+import pytest
+
 import core.auth as auth_mod
 from core.auth import (
     _extract_credentials,
@@ -10,6 +12,18 @@ from core.auth import (
     reload_credentials_into_settings,
     save_credentials,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_settings_creds():
+    """save/reload_credentials 直赋值 settings 全局凭证属性,测试结束后
+    原样恢复,杜绝污染同进程后续用例(如 test_client 的 csrf 断言)。"""
+    saved = {k: getattr(auth_mod.settings, k)
+             for k in ("ACCESS_KEY", "CSRF", "SESSDATA",
+                       "BILI_JCT", "DEDE_USER_ID")}
+    yield
+    for k, v in saved.items():
+        setattr(auth_mod.settings, k, v)
 
 
 class FakeResp:
@@ -37,7 +51,16 @@ def test_extract_credentials_handles_empty():
     assert _extract_credentials({"cookie_info": {"cookies": []}}) == {}
 
 
+def _isolate_cred_env(monkeypatch):
+    """隔离 BILI_* 凭证环境变量:_cred 的 env 优先级最高,会压住
+    save/reload 写入 settings 的内存态,使断言随运行环境漂移。"""
+    for k in ("BILI_ACCESS_KEY", "BILI_CSRF", "BILI_SESSDATA",
+              "BILI_BILI_JCT", "BILI_DEDE_USER_ID"):
+        monkeypatch.delenv(k, raising=False)
+
+
 def test_save_credentials_field_merge(monkeypatch, tmp_path):
+    _isolate_cred_env(monkeypatch)
     monkeypatch.setattr(auth_mod.settings, "CREDENTIALS_JSON_PATH",
                         tmp_path / "credentials.json")
     # "本地文件"源的权威位置是 secrets 对象，settings 属性仅是加载结果
@@ -60,6 +83,7 @@ def test_save_credentials_field_merge(monkeypatch, tmp_path):
 
 def test_reload_credentials(monkeypatch, tmp_path):
     """reload: json 值覆盖旧 settings 属性（常驻进程每轮刷新）。"""
+    _isolate_cred_env(monkeypatch)
     monkeypatch.setattr(auth_mod.settings, "CREDENTIALS_JSON_PATH",
                         tmp_path / "credentials.json")
     (tmp_path / "credentials.json").write_text(
@@ -70,6 +94,7 @@ def test_reload_credentials(monkeypatch, tmp_path):
 
 
 def test_credentials_view_masks(monkeypatch, tmp_path):
+    _isolate_cred_env(monkeypatch)
     monkeypatch.setattr(auth_mod.settings, "CREDENTIALS_JSON_PATH",
                         tmp_path / "credentials.json")
     (tmp_path / "credentials.json").write_text("{}", encoding="utf-8")

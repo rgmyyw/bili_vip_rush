@@ -87,6 +87,24 @@ def phase_pacing(sale_s: float) -> tuple:
         return (1.0, False, False)
 
 
+def effective_sale_s(sale_s: float, open_obs_s) -> float:
+    """开闸锚定:把钟点坐标系的 sale_s 平移到开闸观测锚点坐标系。
+
+    钟点锚定假设 12:00:00.000 准点开闸,实战连续两天实测开闸在
+    +0.2s/+0.35s 漂移——黄金窗押在整点上,真开闸时窗口已过大半。
+    首个放行码(43055/非常规码)的观测时刻即锚点:开闸前的发退回
+    探测段密度,开闸后的发才进黄金窗。锚点缺失/-702 不锚(频控不证
+    明放行)/晚于 RUSH_OPEN_ANCHOR_MAX_S(不可信)时退化钟点锚定。
+    """
+    try:
+        cap = getattr(settings, "RUSH_OPEN_ANCHOR_MAX_S", 1.5)
+        if open_obs_s is not None and 0 < open_obs_s <= cap:
+            return sale_s - open_obs_s
+    except Exception:
+        pass
+    return sale_s
+
+
 def next_interval(attempt: int, elapsed: float,
                   override: float | None = None) -> float:
     """三段自适应间隔：爆发 -> 快速 -> 慢速，叠加 ±JITTER 抖动。
@@ -311,7 +329,7 @@ class RushFlow:
 
         counter = {"lock": threading.Lock(), "n": 0, "timed_out": False,
                    "risk": 0, "crashed": 0, "win_total": 0, "win_702": 0,
-                   "win_rate": 0.0,
+                   "win_rate": 0.0, "open_obs_s": None,
                    "burst": threading.Event()}
         stop_event = threading.Event()
         self._result_lock = threading.Lock()
@@ -404,6 +422,7 @@ class RushFlow:
             self._record("run_summary", attempts=counter["n"],
                          workers_entered=entered,
                          burst_fired=counter["burst"].is_set(),
+                         open_obs_s=counter.get("open_obs_s"),
                          crashed=counter["crashed"],
                          risk_hits=counter["risk"])
         except Exception:
@@ -515,11 +534,11 @@ class RushFlow:
                     return order
                 except BiliApiError as ex:
                     text = (ex.response_text or "")[:500]
+                    _sale_now = ((time.monotonic() - rush_t0)
+                                 - getattr(self, "_lead_s", 0.0))
                     # 哨兵标记:worker-0 在盯梢窗内的发次(复盘时用于
                     # 重建开闸时刻的精确观测序列)
-                    sentinel = (worker_id == 0
-                                and ((time.monotonic() - rush_t0)
-                                     - getattr(self, "_lead_s", 0.0)) < 0.5)
+                    sentinel = (worker_id == 0 and _sale_now < 0.5)
                     self._record("order_fail", attempt=attempt,
                                  worker=worker_id,
                                  plan=plan["name"], code=ex.code,
@@ -548,18 +567,27 @@ class RushFlow:
                             counter["streak702"] = counter.get("streak702", 0) + 1
                         else:
                             counter["streak702"] = 0
-                    # 开闸信号:开售前探测期收到非常规码(非未开售69422/
-                    # 非拥挤43055/非频控-702)=状态突变即开闸,广播全员爆发
-                    if (ex.code not in (69422, 43055, -702)
+                    # 开闸锚点:首个放行码(43055/非常规码)的观测时刻,
+                    # 黄金窗/尾段计时整体平移到它(消除开闸漂移,两天
+                    # 实测 +0.2s/+0.35s);-702 不作锚(只证明频控)。
+                    # 首写即最早观测,时间顺序天然取 min
+                    if ex.code not in (69422, -702):
+                        with counter["lock"]:
+                            if counter.get("open_obs_s") is None:
+                                counter["open_obs_s"] = round(_sale_now, 3)
+                    # 开闸信号:69422=未开售、-702=只证明频控不证明放行,
+                    # 其余码(43055 拥挤在内)=网关已放行=开闸铁证即广播
+                    # 全员爆发。10-02 实测:43055 最早出现在 +0.356s 与
+                    # 开闸时刻一致,且比哨兵的下一发盯梢更快发现放行;
+                    # 监听窗覆盖到余量路 gate 前——burst 唤醒的就是它们
+                    if (ex.code not in (69422, -702)
                             and not counter["burst"].is_set()
-                            and ((time.monotonic() - rush_t0)
-                                 - getattr(self, "_lead_s", 0.0)) < 0.5):
+                            and _sale_now
+                            < getattr(settings, "RUSH_BURST_WINDOW_S", 1.0)):
                         counter["burst"].set()
                         self._record("burst_signal", code=ex.code,
                                      worker=worker_id,
-                                     sale_s=round((time.monotonic() - rush_t0)
-                                                  - getattr(self, "_lead_s",
-                                                            0.0), 3))
+                                     sale_s=round(_sale_now, 3))
                         logger.info("开闸信号(code=%s),全员提前爆发", ex.code)
                     outcome = classify_error(ex)
                     if outcome is Outcome.CREDENTIAL_EXPIRED:
@@ -615,9 +643,14 @@ class RushFlow:
             elapsed = time.monotonic() - rush_t0
             # 时间分段火力 + -702 自适应节流(任何计算异常退化为保守
             # 1s 间隔继续打,本路绝不因节奏计算退出)
-            sale_s = elapsed - getattr(self, "_lead_s", 0.0)  # 距开售
+            sale_s = elapsed - getattr(self, "_lead_s", 0.0)  # 距开售(钟点)
+            # 开闸锚定:首个放行码观测锚点可信时,分段计时整体平移——
+            # 锚点前的发退回探测密度,锚点后才进黄金窗
+            with counter["lock"]:
+                open_obs = counter.get("open_obs_s")
+            eff_sale = effective_sale_s(sale_s, open_obs)
             try:
-                dens, exempt, stop_now = phase_pacing(sale_s)
+                dens, exempt, stop_now = phase_pacing(eff_sale)
                 # 频控硬上限:连续 50 发 -702 后黄金窗豁免失效
                 # (开售若不放行频控,全速=全拒=零命中,恢复节流贴线)
                 if exempt:
@@ -634,6 +667,7 @@ class RushFlow:
                     counter["timed_out"] = True
                 if first:
                     self._record("tail_stop", sale_s=round(sale_s, 2),
+                                 open_obs_s=open_obs,
                                  attempts=counter["n"])
                     self._record_run_summary(counter)
                     logger.info("尾段收兵(开售后 %ss)", sale_s)
