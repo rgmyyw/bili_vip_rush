@@ -201,6 +201,8 @@ class BiliClient:
 
         返回订单信息（含 order_no 等）；成功即锁定名额，需在时限内支付。
         """
+        import json as _json
+        import time as _time
         data = {
             "act_token": plan["act_token"],
             "appId": plan["app_id"],
@@ -212,6 +214,18 @@ class BiliClient:
             "from_activity": 1,
             "pay_sdk_version": "1.5.4",
             "dtype": 3,  # 3=APP（ur 枚举：H5:2, APP:3）
+            # 与 App 真实下单形态全字段对齐(10-01 抓包四次成功样本;
+            # 放行层若按请求形态分级,精简版可能落入低优先级队列)
+            "allow_degrade_payway": "false",
+            "os_ver": "16",
+            "scene": "activity",
+            "returnUrl": "https://m.bilibili.com/doria/pay-success",
+            "sdk_version": _json.dumps(
+                {"code": 0, "data": {"versionCode": "1.5.6"}}),
+            "statistics": _json.dumps(
+                {"appId": 1, "platform": 3, "version": "9.13.0",
+                 "abtest": ""}, separators=(",", ":")),
+            "ts": int(_time.time()),
             "csrf": settings.CSRF,
         }
         return self._request("POST", settings.URL_CREATE_ORDER, data=data)

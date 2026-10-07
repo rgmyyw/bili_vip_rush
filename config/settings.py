@@ -172,7 +172,11 @@ RUSH_EARLY_ADAPTIVE = True    # 按预热实测往返自适应提前量(0.08~0.1
 # 只在稳态成立,开闸瞬间同起跑即爆表。20 路把额度省给开闸后锁单回流窗。
 RUSH_CONCURRENCY = 20         # 20路=哨兵1+第一波7+第二波7+余量5;每路1发/秒贴线
 RUSH_TARGET_RPS = 20.0        # 贴线总速(与 CONCURRENCY 联动:每路 1 发/秒)
-RUSH_VOLLEY_1 = 8             # 第一波 worker 1..7 押 12:00:00.00(拼准点)
+RUSH_VOLLEY_1 = 8             # 第一波 worker 1..7
+RUSH_INFLIGHT_FROM = -0.25    # 在途覆盖:一波在钟点前 250ms 起以 60ms 连发
+                               # (开闸漂移 ±0.25s 不可预测——不赌时刻,用
+                               # 4-6 发在途请求保证任意开闸时刻门口都有人)
+RUSH_INFLIGHT_INTERVAL = 0.06 # 在途间隔
 RUSH_VOLLEY_2 = 7             # 第二波 worker 8..14:开闸信号驱动,兜底 +0.30s
 RUSH_VOLLEY2_FALLBACK = 0.30  # 第二波定时兜底延迟(秒);开闸信号先到先发
 # 余量 worker 15..19:gate=1.0s 起低密度扫尾(收到开闸信号会提前进场)

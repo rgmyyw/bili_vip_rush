@@ -458,7 +458,9 @@ class RushFlow:
                 # volley1..volley1+volley2-1 第二波(开闸信号先到先发,
                 # 兜底 +0.30s);其余为余量路(+1.0s 匀速捡漏)
                 if worker_id < volley1:
-                    gate = 0.0
+                    # 在途覆盖:一波提前进场(钟点-0.25s),开闸漂移窗口内
+                    # 持续在途,不再赌单一开闸时刻
+                    gate = getattr(settings, "RUSH_INFLIGHT_FROM", -0.25)
                 elif worker_id < volley1 + volley2:
                     gate = getattr(settings, "RUSH_VOLLEY2_FALLBACK", 0.30)
                 else:
@@ -703,6 +705,12 @@ class RushFlow:
                 base_sleep = crowd_iv * (
                     1 + random.uniform(-settings.RUSH_JITTER,
                                        settings.RUSH_JITTER))
+            elif (worker_id < max(1, int(getattr(
+                    settings, "RUSH_VOLLEY_1", 8)))
+                    and getattr(settings, "RUSH_INFLIGHT_FROM", -0.25)
+                    <= eff_sale < 0):
+                # 在途覆盖段:一波路 60ms 连发,请求持续在服务器门口
+                base_sleep = getattr(settings, "RUSH_INFLIGHT_INTERVAL", 0.06)
             elif eff_sale < 0:
                 base_sleep = (getattr(settings, "RUSH_PROBE_INTERVAL", 0.3)
                               * (1 + random.uniform(-settings.RUSH_JITTER,
