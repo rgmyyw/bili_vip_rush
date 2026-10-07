@@ -447,6 +447,7 @@ class RushFlow:
         即全局停，绝不连环下单。"""
         sold_out_at = None
         syserr_streak = 0
+        last_was_crowd = False   # 上一发 43055(挤门失败):下一发快速再挤
         while not stop_event.is_set() and time.monotonic() < deadline:
             # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
             # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
@@ -561,6 +562,7 @@ class RushFlow:
                                               "attempts": attempt})
                             stop_event.set()
                             return None
+                    last_was_crowd = (ex.code == 43055)
                     # -702 频控窗口统计(自适应节流依据)+连续计数
                     # (连续被拒达阈值后黄金窗豁免失效,防全速被频控全吞)
                     with counter["lock"]:
@@ -695,9 +697,12 @@ class RushFlow:
             if interval is not None:   # 显式覆盖(测试)优先
                 base_sleep = interval
             elif 0 <= eff_sale < getattr(settings, "RUSH_CROWD_WINDOW", 2.0):
-                base_sleep = (getattr(settings, "RUSH_CROWD_INTERVAL", 0.8)
-                              * (1 + random.uniform(-settings.RUSH_JITTER,
-                                                    settings.RUSH_JITTER)))
+                crowd_iv = (getattr(settings, "RUSH_CROWD_FAST_INTERVAL", 0.6)
+                            if last_was_crowd else
+                            getattr(settings, "RUSH_CROWD_INTERVAL", 0.8))
+                base_sleep = crowd_iv * (
+                    1 + random.uniform(-settings.RUSH_JITTER,
+                                       settings.RUSH_JITTER))
             elif eff_sale < 0:
                 base_sleep = (getattr(settings, "RUSH_PROBE_INTERVAL", 0.3)
                               * (1 + random.uniform(-settings.RUSH_JITTER,
