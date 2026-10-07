@@ -400,6 +400,7 @@ class RushFlow:
             t.start()
         for t in threads:
             t.join()
+        self._record_run_summary(counter)   # 终局汇总(任何终态)
         return orders[0] if orders else None
 
     def _spawn_client(self) -> BiliClient:
@@ -671,7 +672,6 @@ class RushFlow:
                     self._record("tail_stop", sale_s=round(sale_s, 2),
                                  open_obs_s=open_obs,
                                  attempts=counter["n"])
-                    self._record_run_summary(counter)
                     logger.info("尾段收兵(开售后 %ss)", sale_s)
                     self._set_result({"result": "timeout",
                                       "attempts": counter["n"]})
@@ -715,7 +715,6 @@ class RushFlow:
             counter["timed_out"] = True
         if first_timeout and not stop_event.is_set():
             self._record("rush_timeout", attempts=counter["n"])
-            self._record_run_summary(counter)
             logger.warning("坚持 %ss 后仍未抢到", total)
             self._set_result({"result": "timeout", "attempts": counter["n"]})
         return None
