@@ -689,7 +689,19 @@ class RushFlow:
                                  attempts=counter["n"])
                 rate = counter.get("win_rate", 0.0)
             extra = 0.0 if exempt else settings.RUSH_THROTTLE_MAX_S * rate
-            base_sleep = next_interval(attempt, elapsed, interval) * dens
+            # 冲刺窗/探测段用绝对间隔:dens 乘 next_interval 三段基准会
+            # 随全局 attempt 增长漂移(0.04→0.12 后 0.8s 变 2.4s,
+            # 10-07 实证二波第二轮 1.8s 间隔,冲刺密度仅打出一半)
+            if 0 <= eff_sale < getattr(settings, "RUSH_CROWD_WINDOW", 2.0):
+                base_sleep = (getattr(settings, "RUSH_CROWD_INTERVAL", 0.8)
+                              * (1 + random.uniform(-settings.RUSH_JITTER,
+                                                    settings.RUSH_JITTER)))
+            elif eff_sale < 0:
+                base_sleep = (getattr(settings, "RUSH_PROBE_INTERVAL", 0.3)
+                              * (1 + random.uniform(-settings.RUSH_JITTER,
+                                                    settings.RUSH_JITTER)))
+            else:
+                base_sleep = next_interval(attempt, elapsed, interval) * dens
             # 哨兵:worker-0 在开售前后 0.5s 窗口内以 100ms 盯梢
             # (高频捕捉开闸码突变,拉响第二波;消耗 ~5 发额度)
             if (worker_id == 0 and not counter["burst"].is_set()
