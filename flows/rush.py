@@ -56,13 +56,15 @@ def phase_pacing(sale_s: float) -> tuple:
     扫尾;开售后 10s 主动收兵——66 名额早尽,继续打只烧账号频控额度。
     """
     try:
-        if sale_s >= settings.RUSH_TAIL_STOP_S:
+        if sale_s >= getattr(settings, "RUSH_CROWD_STOP_S",
+                              settings.RUSH_TAIL_STOP_S):
+            # 冲刺后直接收兵:拥挤窗结束=名额分尽,继续打只吃 -702
             return (0.0, False, True)
-        if settings.RUSH_PEAK_FROM <= sale_s <= settings.RUSH_PEAK_TO:
-            # 贴线密度:每路间隔=路数/目标速率,总速恒 ~RUSH_TARGET_RPS
-            dens = (max(1, int(settings.RUSH_CONCURRENCY))
-                    / (getattr(settings, "RUSH_TARGET_RPS", 55.0)
-                       * settings.RUSH_BURST_INTERVAL))
+        if 0 <= sale_s < getattr(settings, "RUSH_CROWD_WINDOW", 2.0):
+            # 拥挤冲刺(锚点起):每路 CROWD_INTERVAL,豁免节流——2.4s
+            # 拥挤窗是持续竞争期,密度即穿越期望(10-06 仅 21 发全 43055)
+            dens = (getattr(settings, "RUSH_CROWD_INTERVAL", 0.8)
+                    / settings.RUSH_BURST_INTERVAL)
             return (dens, True, False)
         if sale_s >= settings.RUSH_TAIL_FROM:
             # 尾段目标 ~20 发/秒,dens 按路数换算(固定 12 在 60 路下=125/秒超频)

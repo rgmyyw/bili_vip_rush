@@ -195,18 +195,18 @@ def test_throttle_backoff_grows_with_702_rate(monkeypatch):
 
 # ------------------------------------------------ 时间分段火力
 def test_phase_pacing_windows():
-    """黄金窗豁免全速;尾段降密度;开售 10s 收兵。"""
+    """拥挤冲刺窗豁免;冲刺后收兵;锚定前探测。"""
     from flows.rush import phase_pacing
     d, e, st = phase_pacing(-2.0)   # 探测段:低频密度(300ms 级)
     assert d > 5 and e is False and st is False
-    for t in (-0.02, 0.5):
-        d, e, st = phase_pacing(t)   # 黄金窗:贴线密度(>=4)+豁免节流
-        assert e is True and st is False and d >= 4
-    d, e, st = phase_pacing(0.9)   # 回落段:总速匀速贴线(防 60 路全密度冲爆额度)
-    assert e is False and st is False and d >= 10
-    assert phase_pacing(3.0)[0] >= 12                  # 尾段:低密度(~20发/秒)
+    for t in (0.0, 0.5, 1.9):   # 拥挤冲刺窗:锚点起 2s,每路 0.8s 豁免
+        d, e, st = phase_pacing(t)
+        assert e is True and st is False and d >= 15
+    d, e, st = phase_pacing(2.3)   # 冲刺后直接收兵(拥挤窗尽=名额尽)
+    assert st is True
+    assert phase_pacing(3.0)[2] is True                # 3.0s 已过冲刺收兵点
     dens, _, stop = phase_pacing(10.0)
-    assert stop is True                                # 到点收兵
+    assert stop is True                                # 远超收兵点
 
 
 # ------------------------------------------------ 崩溃兜底(分段火力)

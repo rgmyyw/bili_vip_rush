@@ -44,10 +44,10 @@ def test_effective_sale_shifts_by_anchor():
 def test_anchor_combo_pacing(monkeypatch):
     """锚定组合 phase_pacing:锚点前退探测密度,锚点后才进黄金窗。"""
     monkeypatch.setattr(rush_mod.settings, "RUSH_OPEN_ANCHOR_MAX_S", 1.5)
-    # 无锚点:sale_s=1.0 已出钟点黄金窗 -> 回落段,不豁免
+    # 无锚点:sale_s=1.0 在拥挤冲刺窗(锚点缺失=钟点计) -> 冲刺豁免
     d, e, st = phase_pacing(effective_sale_s(1.0, None))
-    assert e is False and st is False
-    # 锚点 0.35:钟点 1.0 即开闸后 0.65s -> 黄金窗豁免
+    assert e is True and st is False
+    # 锚点 0.35:钟点 1.0 即开闸后 0.65s -> 仍在冲刺窗
     d, e, st = phase_pacing(effective_sale_s(1.0, 0.35))
     assert e is True and st is False
     # 锚点 0.35:钟点 0.2 实为开闸前 -> 探测段低密度
