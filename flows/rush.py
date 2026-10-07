@@ -692,7 +692,9 @@ class RushFlow:
             # 冲刺窗/探测段用绝对间隔:dens 乘 next_interval 三段基准会
             # 随全局 attempt 增长漂移(0.04→0.12 后 0.8s 变 2.4s,
             # 10-07 实证二波第二轮 1.8s 间隔,冲刺密度仅打出一半)
-            if 0 <= eff_sale < getattr(settings, "RUSH_CROWD_WINDOW", 2.0):
+            if interval is not None:   # 显式覆盖(测试)优先
+                base_sleep = interval
+            elif 0 <= eff_sale < getattr(settings, "RUSH_CROWD_WINDOW", 2.0):
                 base_sleep = (getattr(settings, "RUSH_CROWD_INTERVAL", 0.8)
                               * (1 + random.uniform(-settings.RUSH_JITTER,
                                                     settings.RUSH_JITTER)))
