@@ -92,15 +92,16 @@ def phase_pacing(sale_s: float) -> tuple:
 def effective_sale_s(sale_s: float, open_obs_s) -> float:
     """开闸锚定:把钟点坐标系的 sale_s 平移到开闸观测锚点坐标系。
 
-    钟点锚定假设 12:00:00.000 准点开闸,实战连续两天实测开闸在
-    +0.2s/+0.35s 漂移——黄金窗押在整点上,真开闸时窗口已过大半。
-    首个放行码(43055/非常规码)的观测时刻即锚点:开闸前的发退回
-    探测段密度,开闸后的发才进黄金窗。锚点缺失/-702 不锚(频控不证
-    明放行)/晚于 RUSH_OPEN_ANCHOR_MAX_S(不可信)时退化钟点锚定。
+    钟点锚定假设 12:00:00.000 准点开闸,实测开售时刻 -0.073~+0.35s
+    随机漂移且可早于整点(10-08 首个 43055 在 -0.073s,10-03 亦负)。
+    首个放行码(43055/非常规码)的观测时刻即锚点:锚点前的发退回探测
+    段密度,锚点后的发才进黄金窗。锚点缺失/-702 不锚(频控不证明放行)/
+    越界(早于 MIN/晚于 MAX,不可信)时退化钟点锚定。
     """
     try:
+        lo = getattr(settings, "RUSH_OPEN_ANCHOR_MIN_S", -0.3)
         cap = getattr(settings, "RUSH_OPEN_ANCHOR_MAX_S", 1.5)
-        if open_obs_s is not None and 0 < open_obs_s <= cap:
+        if open_obs_s is not None and lo <= open_obs_s <= cap:
             return sale_s - open_obs_s
     except Exception:
         pass
@@ -108,18 +109,19 @@ def effective_sale_s(sale_s: float, open_obs_s) -> float:
 
 
 def hedge_worker_ids() -> set:
-    """形态对冲路集合:取二波(开闸信号驱动段)末尾 N 路。
+    """形态对冲路集合:取一波(在途覆盖段)前 N 路。
 
-    对冲路用变体 BUILD+UA 下单(网关若按客户端版本/AB 桶分级,等于
-    同时买两个桶的彩票);一波(在途覆盖)与主形态保持冻结不动。
+    10-08 复盘:对冲放二波末(w13/14)首发 +0.03 恰落 69422 未激活块,
+    6 发预算换 0 个拥挤层样本,实验白做。改放一波(w1/w2)——与主形态
+    同刻到达拥挤层,响应码有无分岔一眼可判。worker-0(哨兵)保持主形态,
+    保证开闸观测序列形态一致。
     """
     n = max(0, int(getattr(settings, "RUSH_HEDGE_WORKERS", 0) or 0))
     v1 = max(1, int(getattr(settings, "RUSH_VOLLEY_1", 1)))
-    v2 = max(0, int(getattr(settings, "RUSH_VOLLEY_2", 0)))
-    if n <= 0 or v2 <= 0:
+    if n <= 0:
         return set()
-    n = min(n, v2)
-    return set(range(v1 + v2 - n, v1 + v2))
+    n = min(n, max(0, v1 - 1))
+    return set(range(1, 1 + n))
 
 
 def next_interval(attempt: int, elapsed: float,
@@ -442,7 +444,10 @@ class RushFlow:
             if not getattr(settings, "REFLOW_ENABLED", True):
                 return None
             reason = (self.last_result or {}).get("result")
-            if reason not in ("timeout", "sold_out", "max_attempts"):
+            if reason not in ("timeout", "sold_out", "max_attempts",
+                              "budget_cap"):
+                # freq_wall/risk_control 不回流:账号已被墙/被风控,
+                # 追加发数只加深惩罚
                 self._record("reflow_skip", reason=reason or "unknown")
                 return None
             open_obs = counter.get("open_obs_s")
@@ -585,9 +590,17 @@ class RushFlow:
         (回流与主轮分开计数)。"""
         sold_out_at = None
         syserr_streak = 0
-        last_was_crowd = False   # 上一发 43055(挤门失败):下一发快速再挤
-        attempt_cap = (settings.RUSH_MAX_ATTEMPTS
-                       if max_attempts is None else max_attempts)
+        if max_attempts is not None:
+            attempt_cap = max_attempts
+            cap_reason = "max_attempts"
+        else:
+            # 主轮:额度预算优先于旧熔断上限——实测账号级 ~30 发,第 31
+            # 发起必吃 -702(10-08 恰 30 发业务层,31 起 43 发全拒)
+            attempt_cap = min(int(getattr(settings, "RUSH_ATTEMPT_BUDGET",
+                                          30)),
+                              int(getattr(settings, "RUSH_MAX_ATTEMPTS",
+                                          1000)))
+            cap_reason = "budget_cap"
         # 本路是否形态对冲路(变体 BUILD+UA):逐发 variant 标记的依据
         is_hedge = worker_id in getattr(self, "_hedge_workers", set())
         while not stop_event.is_set() and time.monotonic() < deadline:
@@ -633,10 +646,11 @@ class RushFlow:
                 counter["n"] += 1
                 attempt = counter["n"]
                 if attempt > attempt_cap:
-                    self._record("stop_reason", reason="max_attempts",
+                    self._record("stop_reason", reason=cap_reason,
                                  attempts=attempt - 1)
-                    logger.warning("达到尝试上限 %s 次", attempt_cap)
-                    self._set_result({"result": "max_attempts",
+                    logger.warning("发数到达上限 %s(%s),收兵",
+                                   attempt_cap, cap_reason)
+                    self._set_result({"result": cap_reason,
                                       "attempts": attempt - 1})
                     stop_event.set()
                     return None
@@ -716,16 +730,32 @@ class RushFlow:
                                               "attempts": attempt})
                             stop_event.set()
                             return None
-                    last_was_crowd = (ex.code == 43055)
                     # -702 频控窗口统计(自适应节流依据)+连续计数
                     # (连续被拒达阈值后黄金窗豁免失效,防全速被频控全吞)
+                    streak_now = 0
                     with counter["lock"]:
                         counter["win_total"] += 1
                         if ex.code == -702:
                             counter["win_702"] += 1
-                            counter["streak702"] = counter.get("streak702", 0) + 1
+                            counter["streak702"] = (counter.get("streak702", 0)
+                                                    + 1)
+                            streak_now = counter["streak702"]
                         else:
                             counter["streak702"] = 0
+                    # -702 熔断:七日铁律,频控墙后 >130 发穿透 0 次
+                    # (10-08 又 43 发全拒)——连续 N 发即全局收兵,
+                    # 墙后一发都不值,省下的是账号信用
+                    if (ex.code == -702 and streak_now >= int(getattr(
+                            settings, "RUSH_FREQ_WALL_STREAK", 3))):
+                        self._record("stop_reason", reason="freq_wall",
+                                     streak=streak_now,
+                                     attempts=counter["n"])
+                        logger.warning("频控墙(连续 %s 发 -702),全局收兵",
+                                       streak_now)
+                        self._set_result({"result": "freq_wall",
+                                          "attempts": counter["n"]})
+                        stop_event.set()
+                        return None
                     # 开闸锚点:首个放行码(43055/非常规码)的观测时刻,
                     # 黄金窗/尾段计时整体平移到它(消除开闸漂移,两天
                     # 实测 +0.2s/+0.35s);-702 不作锚(只证明频控)。
@@ -855,9 +885,11 @@ class RushFlow:
             if interval is not None:   # 显式覆盖(测试)优先
                 base_sleep = interval
             elif 0 <= eff_sale < getattr(settings, "RUSH_CROWD_WINDOW", 2.0):
-                crowd_iv = (getattr(settings, "RUSH_CROWD_FAST_INTERVAL", 0.6)
-                            if last_was_crowd else
-                            getattr(settings, "RUSH_CROWD_INTERVAL", 0.8))
+                # 冲刺窗内第二发起:固定短间隔(0.3s 级)——账号级额度仅
+                # ~30 发且拥挤层 +0.6s 仍活着,余量预算必须尽快落进活窗;
+                # 旧 0.8s/0.6s 会把二轮推到 +0.6 之后喂频控墙(10-08 实证)
+                crowd_iv = getattr(settings, "RUSH_CROWD_SECOND_INTERVAL",
+                                   0.3)
                 base_sleep = crowd_iv * (
                     1 + random.uniform(-settings.RUSH_JITTER,
                                        settings.RUSH_JITTER))

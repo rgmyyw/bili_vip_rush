@@ -37,8 +37,11 @@ def test_effective_sale_shifts_by_anchor():
     assert effective_sale_s(1.0, 0.35) == 0.65      # 平移
     assert effective_sale_s(1.0, None) == 1.0       # 无锚点:原样
     assert effective_sale_s(1.0, 0.0) == 1.0        # 0 锚(准点)不平移
-    assert effective_sale_s(1.0, -0.2) == 1.0       # 负锚(开闸前观测)无效
-    assert effective_sale_s(1.0, 2.0) == 1.0        # 超上限:不可信不锚
+    assert effective_sale_s(1.0, -0.2) == 1.2       # 负锚:开售早于整点
+                                                   # (10-08 实测首个 43055
+                                                   #  在 -0.073s)
+    assert effective_sale_s(1.0, -0.4) == 1.0       # 越下界:不可信不锚
+    assert effective_sale_s(1.0, 2.0) == 1.0        # 越上界:不可信不锚
 
 
 def test_anchor_combo_pacing(monkeypatch):
@@ -55,6 +58,9 @@ def test_anchor_combo_pacing(monkeypatch):
     assert d > 5 and e is False
     # 锚定后收兵点整体后移(钟点 10.4 = 锚定 10.05),仍在 duration 兜底内
     assert phase_pacing(effective_sale_s(10.4, 0.35))[2] is True
+    # 负锚(开售早于整点):钟点 -0.1 实为开闸后 0.1s -> 冲刺窗豁免
+    d, e, st = phase_pacing(effective_sale_s(-0.1, -0.2))
+    assert e is True and st is False
 
 
 def test_volley_layout_20():

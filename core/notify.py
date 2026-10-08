@@ -29,6 +29,8 @@ REASON_TEXT = {
     "credential_expired": "凭证失效（需重新抓包）",
     "already_owned": "已有订单/已购买",
     "max_attempts": "达到重试上限",
+    "budget_cap": "弹药预算用尽(30发)未抢到",
+    "freq_wall": "触发频控墙(-702)已收兵",
     "timeout": "超时未抢到",
     "crashed": "运行异常",
     "risk_control": "触发风控已停抢",

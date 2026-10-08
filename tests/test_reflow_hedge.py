@@ -169,11 +169,11 @@ def test_reflow_respects_pause(tmp_path, monkeypatch):
 
 # ------------------------------------------------ 形态对冲
 def test_hedge_worker_ids_default():
-    """默认配置:二波(8..14)末尾 2 路 = {13,14}。"""
+    """默认配置:一波(w1..7)前 2 路 = {1,2},与主形态同刻到达拥挤层。"""
     ids = hedge_worker_ids()
-    assert ids == {13, 14}
-    v1, v2 = int(st.RUSH_VOLLEY_1), int(st.RUSH_VOLLEY_2)
-    assert ids and ids.issubset(set(range(v1, v1 + v2)))  # 只在二波段
+    assert ids == {1, 2}
+    v1 = int(st.RUSH_VOLLEY_1)
+    assert ids and ids.issubset(set(range(1, v1)))   # 一波段,不含哨兵 w0
 
 
 def test_form_hedge_event_and_variant_tags(tmp_path):
@@ -182,14 +182,14 @@ def test_form_hedge_event_and_variant_tags(tmp_path):
     flow.rush(target_ts=time.time() - 1, early_seconds=0, duration=0.6)
     evs = _events(tmp_path)
     hedge_ev = [e for e in evs if e.get("event") == "form_hedge"]
-    assert hedge_ev and hedge_ev[0]["workers"] == [13, 14]
+    assert hedge_ev and hedge_ev[0]["workers"] == [1, 2]
     assert hedge_ev[0]["build"] == "9130500"
     summary = [e for e in evs if e.get("event") == "run_summary"][0]
-    assert summary["hedge_workers"] == [13, 14]
+    assert summary["hedge_workers"] == [1, 2]
     fails = [e for e in evs if e.get("event") == "order_fail"]
     assert fails                                 # 主轮有逐发记录
     v_fails = [f for f in fails if f.get("variant")]
-    assert v_fails and {f["worker"] for f in v_fails} == {13, 14}
+    assert v_fails and {f["worker"] for f in v_fails} == {1, 2}
     for f in fails:                              # 每发自带距开售秒数
         assert isinstance(f.get("sale_s"), float)
 
