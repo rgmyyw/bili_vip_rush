@@ -623,15 +623,21 @@ class RushFlow:
                 sale_now = ((time.monotonic() - rush_t0)
                             - getattr(self, "_lead_s", 0.0))
                 if sale_now < gate and not counter["burst"].is_set():
+                    if stop_event.is_set():
+                        continue       # 熔断已全局停,波门内不再发
                     if gate - sale_now > 0.05:
                         # 短睡片:开闸信号到达后最多 50ms 即可进场
                         time.sleep(min(gate - sale_now - 0.05, 0.05))
                         continue
-                    # 末段忙等:越过波门或收到开闸信号即进场
+                    # 末段忙等:越过波门或收到开闸信号即进场;全局停
+                    # (预算/频控熔断)同样立即退出,防自旋过门后补枪
                     while (((time.monotonic() - rush_t0)
                             - getattr(self, "_lead_s", 0.0)) < gate
-                           and not counter["burst"].is_set()):
+                           and not counter["burst"].is_set()
+                           and not stop_event.is_set()):
                         pass
+                    if stop_event.is_set():
+                        continue
             # 复盘留痕:本路首次进场,记录实际进场时刻(距开售)与
             # 触发方式(定时过门/开闸信号唤醒)——回溯各波唤醒精度
             if worker_id > 0 and not counter.get("entered_" + str(worker_id)):

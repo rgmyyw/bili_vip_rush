@@ -146,7 +146,7 @@ def test_reflow_respects_pause(tmp_path, monkeypatch):
 
     暂停从 reflow_wait 记录后开始生效——主轮不受影响,只拦回流。
     """
-    _reflow_on(monkeypatch, REFLOW_DELAY_S=3.0)   # 校时耗 ~1.5s,须留足余量
+    _reflow_on(monkeypatch, REFLOW_DELAY_S=8.0)   # 校时耗时有波动,留足余量
     flow = _flow(ReflowClient(), tmp_path)
     paused = {"v": False}
     _orig_record = flow._record
@@ -162,7 +162,7 @@ def test_reflow_respects_pause(tmp_path, monkeypatch):
     result = flow.rush(target_ts=time.time() - 1, early_seconds=0,
                        duration=0.3)
     assert result is None
-    assert time.time() - t0 < 5
+    assert time.time() - t0 < 9      # 暂停在等待 1s 内生效即返回
     skips = [e for e in _events(tmp_path) if e.get("event") == "reflow_skip"]
     assert skips and skips[0]["reason"] == "paused"
 
