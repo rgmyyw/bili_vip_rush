@@ -107,6 +107,21 @@ def effective_sale_s(sale_s: float, open_obs_s) -> float:
     return sale_s
 
 
+def hedge_worker_ids() -> set:
+    """形态对冲路集合:取二波(开闸信号驱动段)末尾 N 路。
+
+    对冲路用变体 BUILD+UA 下单(网关若按客户端版本/AB 桶分级,等于
+    同时买两个桶的彩票);一波(在途覆盖)与主形态保持冻结不动。
+    """
+    n = max(0, int(getattr(settings, "RUSH_HEDGE_WORKERS", 0) or 0))
+    v1 = max(1, int(getattr(settings, "RUSH_VOLLEY_1", 1)))
+    v2 = max(0, int(getattr(settings, "RUSH_VOLLEY_2", 0)))
+    if n <= 0 or v2 <= 0:
+        return set()
+    n = min(n, v2)
+    return set(range(v1 + v2 - n, v1 + v2))
+
+
 def next_interval(attempt: int, elapsed: float,
                   override: float | None = None) -> float:
     """三段自适应间隔：爆发 -> 快速 -> 慢速，叠加 ±JITTER 抖动。
@@ -235,6 +250,7 @@ class RushFlow:
                      ntp_offset_s=(round(ntp_off, 4)
                                    if ntp_off is not None else None),
                      target_ts=target_ts)
+        self._offset = offset   # 回流等待复用同一校时结果
 
         early = settings.RUSH_EARLY_SECONDS if early_seconds is None else early_seconds
         total = settings.RUSH_DURATION_SECONDS if duration is None else duration
@@ -396,12 +412,117 @@ class RushFlow:
 
         threads = [threading.Thread(target=_worker, args=(i, c), daemon=True)
                    for i, c in enumerate(clients)]
+        # 形态对冲路:二波末尾 N 路换变体 BUILD+UA(详见 hedge_worker_ids)
+        self._hedge_workers = hedge_worker_ids()
         for t in threads:
             t.start()
         for t in threads:
             t.join()
         self._record_run_summary(counter)   # 终局汇总(任何终态)
-        return orders[0] if orders else None
+        order = orders[0] if orders else None
+        if order is None:
+            order = self._reflow_pickup(target_ts, counter, clients)
+        return order
+
+    def _reflow_pickup(self, target_ts, counter, clients):
+        """回流捡漏窗:12:00 锁单者 10 分钟支付时效到期未付,库存释放。
+
+        竞争强度远低于开售瞬间;主轮 timeout/sold_out/max_attempts 后,
+        等到锚点开闸+支付时效(REFLOW_DELAY_S),以 0.4 发/秒低密度值守
+        REFLOW_WINDOW_S。成功即常规成功通知(带支付链接)。
+        已购安全闸:值守前复查 hasBuy 防重复下单;若发现服务端已购而
+        本地无单(12:00 成交但响应丢失),紧急通知人工去 App 支付。
+        """
+        try:
+            if not getattr(settings, "REFLOW_ENABLED", True):
+                return None
+            reason = (self.last_result or {}).get("result")
+            if reason not in ("timeout", "sold_out", "max_attempts"):
+                self._record("reflow_skip", reason=reason or "unknown")
+                return None
+            open_obs = counter.get("open_obs_s")
+            if open_obs is None:
+                self._record("reflow_skip", reason="no_open_anchor")
+                return None
+            # 已购安全闸(兼漏单探测)
+            try:
+                comp = self.client.get_buy_component()
+                for plan in self.plans:
+                    st = next((b for b in comp.get("buySets", [])
+                               if b.get("token") == plan["act_token"]), None)
+                    if st and st.get("hasBuy"):
+                        self._record("reflow_skip",
+                                     reason="already_bought_server_side",
+                                     state=st)
+                        from core.notify import notify_all
+                        notify_all(
+                            "[B站抢购] 疑似成交未识别,请立即人工处理",
+                            "服务端显示已购买,但本地未记录订单。请马上打开 "
+                            "B站App 查看订单列表,若有未支付订单立刻支付"
+                            "(时效仅 10 分钟)!")
+                        return None
+            except Exception:
+                logger.exception("回流前资格复查失败,按计划继续值守")
+            wait_until = (target_ts + open_obs
+                          + float(settings.REFLOW_DELAY_S))
+            self._record("reflow_wait", at=round(wait_until, 1),
+                         delay_s=settings.REFLOW_DELAY_S)
+            while True:
+                remain = seconds_until(wait_until,
+                                       getattr(self, "_offset", 0.0))
+                if remain <= 0:
+                    break
+                if is_paused():
+                    self._record("reflow_skip", reason="paused")
+                    return None
+                time.sleep(min(remain, 1.0))
+            self._set_phase("reflow")
+            n = max(1, int(settings.REFLOW_WORKERS))
+            pool = [c for c in (clients or []) if c is not None][:n]
+            pool = pool or [self.client]
+            for c in pool:
+                try:
+                    c.phase = "reflow"
+                except Exception:
+                    pass
+            counter2 = {"lock": threading.Lock(), "n": 0,
+                        "timed_out": False, "risk": 0, "crashed": 0,
+                        "win_total": 0, "win_702": 0, "win_rate": 0.0,
+                        "open_obs_s": None, "burst": threading.Event()}
+            # 预置开闸态:回流 worker 直接进场,不吃主轮波门
+            counter2["burst"].set()
+            stop2 = threading.Event()
+            deadline2 = time.monotonic() + float(settings.REFLOW_WINDOW_S)
+            rush_t0_2 = time.monotonic()
+            self._record("reflow_start", workers=len(pool),
+                         interval=settings.REFLOW_INTERVAL,
+                         window_s=settings.REFLOW_WINDOW_S)
+            got: list = []
+
+            def _rw(i, c):
+                o = self._rush_attempts(
+                    deadline2, float(settings.REFLOW_WINDOW_S), rush_t0_2,
+                    stop2, counter2, c, 100 + i,
+                    interval=float(settings.REFLOW_INTERVAL),
+                    pacing_off=True,
+                    max_attempts=int(settings.REFLOW_MAX_ATTEMPTS))
+                if o is not None:
+                    got.append(o)
+                    stop2.set()
+
+            threads = [threading.Thread(target=_rw, args=(i, c), daemon=True)
+                       for i, c in enumerate(pool)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self._record("reflow_done", attempts=counter2["n"])
+            return got[0] if got else None
+        except Exception:
+            # 回流是纯增量彩蛋:任何异常都不影响主轮结果与通知
+            logger.exception("回流值守异常(忽略,不影响主轮)")
+            self._record("reflow_error")
+            return None
 
     def _spawn_client(self) -> BiliClient:
         """为并发 worker 克隆 client：独立连接池，共享日志审计。"""
@@ -441,13 +562,20 @@ class RushFlow:
                 self.last_result = result
 
     def _rush_attempts(self, deadline, total, rush_t0, stop_event, counter,
-                       client, worker_id, interval=None) -> dict | None:
+                       client, worker_id, interval=None, pacing_off=False,
+                       max_attempts=None) -> dict | None:
         """单路尝试循环（串行模式同样走这里）。多路共享尝试计数/停抢
         标志/终态：任一路成功或命中终态（已购/凭证失效/售罄超时/达上限）
-        即全局停，绝不连环下单。"""
+        即全局停，绝不连环下单。
+
+        pacing_off:回流值守用——跳过分段节奏(黄金窗/收兵判定对回流
+        无意义),只按 interval 匀速打。max_attempts:独立发数上限
+        (回流与主轮分开计数)。"""
         sold_out_at = None
         syserr_streak = 0
         last_was_crowd = False   # 上一发 43055(挤门失败):下一发快速再挤
+        attempt_cap = (settings.RUSH_MAX_ATTEMPTS
+                       if max_attempts is None else max_attempts)
         while not stop_event.is_set() and time.monotonic() < deadline:
             # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
             # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
@@ -490,11 +618,10 @@ class RushFlow:
             with counter["lock"]:
                 counter["n"] += 1
                 attempt = counter["n"]
-                if attempt > settings.RUSH_MAX_ATTEMPTS:
+                if attempt > attempt_cap:
                     self._record("stop_reason", reason="max_attempts",
                                  attempts=attempt - 1)
-                    logger.warning("达到尝试上限 %s 次",
-                                   settings.RUSH_MAX_ATTEMPTS)
+                    logger.warning("达到尝试上限 %s 次", attempt_cap)
                     self._set_result({"result": "max_attempts",
                                       "attempts": attempt - 1})
                     stop_event.set()
@@ -516,9 +643,16 @@ class RushFlow:
                             plan["name"], plan.get("panel_type"))
                     continue
                 try:
-                    order = client.create_order(plan)
+                    # 形态对冲:对冲路换变体 BUILD+UA(网关若按客户端
+                    # 版本/AB 桶分级,两个桶同时下注);payload 字段不变
+                    p = plan
+                    if worker_id in getattr(self, "_hedge_workers", set()):
+                        p = dict(plan,
+                                 _build=settings.RUSH_HEDGE_VARIANT_BUILD,
+                                 _ua=settings.RUSH_HEDGE_VARIANT_UA)
+                    order = client.create_order(p)
                     try:
-                        pay_link = client.pay_link(plan)
+                        pay_link = client.pay_link(p)
                     except Exception:  # 日志辅助失败不影响主流程
                         pay_link = ""
                     # 双重校验：create 成功后向 order/status 确认订单状态
@@ -656,18 +790,22 @@ class RushFlow:
             with counter["lock"]:
                 open_obs = counter.get("open_obs_s")
             eff_sale = effective_sale_s(sale_s, open_obs)
-            try:
-                dens, exempt, stop_now = phase_pacing(eff_sale)
-                # 频控硬上限:连续 50 发 -702 后黄金窗豁免失效
-                # (开售若不放行频控,全速=全拒=零命中,恢复节流贴线)
-                if exempt:
-                    with counter["lock"]:
-                        if counter.get("streak702", 0) >= 50:
-                            exempt = False
-            except Exception:
-                logger.exception("节奏计算异常,保守节奏继续")
-                self._record("pacing_fallback", worker=worker_id)
+            if pacing_off:
+                # 回流值守:不吃分段节奏(黄金窗/收兵判定不适用),匀速打
                 dens, exempt, stop_now = 1.0, False, False
+            else:
+                try:
+                    dens, exempt, stop_now = phase_pacing(eff_sale)
+                    # 频控硬上限:连续 50 发 -702 后黄金窗豁免失效
+                    # (开售若不放行频控,全速=全拒=零命中,恢复节流贴线)
+                    if exempt:
+                        with counter["lock"]:
+                            if counter.get("streak702", 0) >= 50:
+                                exempt = False
+                except Exception:
+                    logger.exception("节奏计算异常,保守节奏继续")
+                    self._record("pacing_fallback", worker=worker_id)
+                    dens, exempt, stop_now = 1.0, False, False
             if stop_now:
                 with counter["lock"]:
                     first = not counter["timed_out"]

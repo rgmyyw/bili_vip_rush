@@ -228,7 +228,14 @@ class BiliClient:
             "ts": int(_time.time()),
             "csrf": settings.CSRF,
         }
-        return self._request("POST", settings.URL_CREATE_ORDER, data=data)
+        # 形态对冲:plan 带 _build/_ua 时请求级覆盖(签名前注入 build,
+        # 请求级 UA 头),session 全局形态不受污染——主形态保持冻结
+        extra_params = {"build": plan["_build"]} if plan.get("_build") else {}
+        extra_headers = ({"User-Agent": plan["_ua"]}
+                         if plan.get("_ua") else {})
+        return self._request("POST", settings.URL_CREATE_ORDER, data=data,
+                             extra_params=extra_params or None,
+                             extra_headers=extra_headers or None)
 
     def get_order_status(self, order: dict, app_id: str = "241") -> dict:
         """下单后校验订单状态（双重校验：create 成功 -> status 确认）。
