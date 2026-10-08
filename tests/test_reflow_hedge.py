@@ -106,6 +106,9 @@ def test_reflow_picks_up_after_timeout(tmp_path, monkeypatch):
     assert ok and ok[0]["worker"] >= 100       # 回流 worker 独立编号
     assert flow.last_result["result"] == "success"
     assert flow.last_result["pay_link"]        # 通知链路带支付链接
+    done = [e for e in evs if e.get("event") == "reflow_done"]
+    assert done and done[0]["result"] == "success"
+    assert done[0]["entered"] >= 1 and done[0]["attempts"] >= 1
 
 
 def test_reflow_skips_when_credential_expired(tmp_path, monkeypatch):
@@ -171,6 +174,24 @@ def test_hedge_worker_ids_default():
     assert ids == {13, 14}
     v1, v2 = int(st.RUSH_VOLLEY_1), int(st.RUSH_VOLLEY_2)
     assert ids and ids.issubset(set(range(v1, v1 + v2)))  # 只在二波段
+
+
+def test_form_hedge_event_and_variant_tags(tmp_path):
+    """复盘留痕:form_hedge 一行自描述 + 对冲路逐发 variant 标记。"""
+    flow = _flow(ReflowClient(), tmp_path)
+    flow.rush(target_ts=time.time() - 1, early_seconds=0, duration=0.6)
+    evs = _events(tmp_path)
+    hedge_ev = [e for e in evs if e.get("event") == "form_hedge"]
+    assert hedge_ev and hedge_ev[0]["workers"] == [13, 14]
+    assert hedge_ev[0]["build"] == "9130500"
+    summary = [e for e in evs if e.get("event") == "run_summary"][0]
+    assert summary["hedge_workers"] == [13, 14]
+    fails = [e for e in evs if e.get("event") == "order_fail"]
+    assert fails                                 # 主轮有逐发记录
+    v_fails = [f for f in fails if f.get("variant")]
+    assert v_fails and {f["worker"] for f in v_fails} == {13, 14}
+    for f in fails:                              # 每发自带距开售秒数
+        assert isinstance(f.get("sale_s"), float)
 
 
 def test_hedge_worker_ids_off(monkeypatch):

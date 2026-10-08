@@ -414,6 +414,11 @@ class RushFlow:
                    for i, c in enumerate(clients)]
         # 形态对冲路:二波末尾 N 路换变体 BUILD+UA(详见 hedge_worker_ids)
         self._hedge_workers = hedge_worker_ids()
+        # 复盘留痕:本轮对冲配置一行自描述(空列表=未启用),逐发另有
+        # variant 标记,二者配合可完整重建"变体桶 vs 主形态桶"的分桶对比
+        self._record("form_hedge", workers=sorted(self._hedge_workers),
+                     build=settings.RUSH_HEDGE_VARIANT_BUILD,
+                     ua_tail=settings.RUSH_HEDGE_VARIANT_UA[-30:])
         for t in threads:
             t.start()
         for t in threads:
@@ -516,7 +521,12 @@ class RushFlow:
                 t.start()
             for t in threads:
                 t.join()
-            self._record("reflow_done", attempts=counter2["n"])
+            # 回流终局:发数/进场数/终态,复盘时与 reflow_wait/start 串成
+            # 完整时间线(未启用/被闸时只有 reflow_skip 一行,同样可读)
+            self._record("reflow_done", attempts=counter2["n"],
+                         entered=sum(1 for k in counter2
+                                     if str(k).startswith("entered_")),
+                         result=(self.last_result or {}).get("result"))
             return got[0] if got else None
         except Exception:
             # 回流是纯增量彩蛋:任何异常都不影响主轮结果与通知
@@ -547,6 +557,8 @@ class RushFlow:
                          workers_entered=entered,
                          burst_fired=counter["burst"].is_set(),
                          open_obs_s=counter.get("open_obs_s"),
+                         hedge_workers=sorted(
+                             getattr(self, "_hedge_workers", set()) or []),
                          crashed=counter["crashed"],
                          risk_hits=counter["risk"])
         except Exception:
@@ -576,6 +588,8 @@ class RushFlow:
         last_was_crowd = False   # 上一发 43055(挤门失败):下一发快速再挤
         attempt_cap = (settings.RUSH_MAX_ATTEMPTS
                        if max_attempts is None else max_attempts)
+        # 本路是否形态对冲路(变体 BUILD+UA):逐发 variant 标记的依据
+        is_hedge = worker_id in getattr(self, "_hedge_workers", set())
         while not stop_event.is_set() and time.monotonic() < deadline:
             # 探测-爆发:开售前仅 worker-0 低频探测;其余路休眠到开售
             # 瞬间(最后 50ms 忙等保毫秒级唤醒),频控信用留给爆发
@@ -646,7 +660,7 @@ class RushFlow:
                     # 形态对冲:对冲路换变体 BUILD+UA(网关若按客户端
                     # 版本/AB 桶分级,两个桶同时下注);payload 字段不变
                     p = plan
-                    if worker_id in getattr(self, "_hedge_workers", set()):
+                    if is_hedge:
                         p = dict(plan,
                                  _build=settings.RUSH_HEDGE_VARIANT_BUILD,
                                  _ua=settings.RUSH_HEDGE_VARIANT_UA)
@@ -662,11 +676,13 @@ class RushFlow:
                         order_status = {"check_error": str(ex)}
                     self._record("order_ok", attempt=attempt,
                                  worker=worker_id,
+                                 variant=True if is_hedge else None,
                                  plan=plan["name"], order=order,
                                  order_status=order_status,
                                  pay_link=pay_link)
-                    logger.info("下单成功(worker-%s): %s -> %s (status=%s)",
-                                worker_id, plan["name"], order, order_status)
+                    logger.info("下单成功(worker-%s%s): %s -> %s (status=%s)",
+                                worker_id, "[变体]" if is_hedge else "",
+                                plan["name"], order, order_status)
                     self._set_result({"result": "success", "order": order,
                                       "pay_link": pay_link,
                                       "attempts": attempt}, force=True)
@@ -681,8 +697,10 @@ class RushFlow:
                     sentinel = (worker_id == 0 and _sale_now < 0.5)
                     self._record("order_fail", attempt=attempt,
                                  worker=worker_id,
+                                 variant=True if is_hedge else None,
                                  plan=plan["name"], code=ex.code,
                                  message=str(ex), raw=text,
+                                 sale_s=round(_sale_now, 3),
                                  sentinel=sentinel)
                     # 风控熔断:412/403 达阈值即全局停(多路并发下防持续
                     # 轰炸被拉黑——宁可停手保账号)

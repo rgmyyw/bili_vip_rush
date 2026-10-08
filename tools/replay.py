@@ -72,6 +72,21 @@ def report(path: Path):
         for api, code, msg, cnt in failures:
             print(f"  {api[:34]:<34} code={code:<6} ×{cnt:<3} {msg}")
 
+    # 形态对冲分桶对比:变体路(BUILD 9130500) vs 主形态路的码分布——
+    # 两桶响应分岔=网关按客户端版本分级放行的直接证据
+    fail_events = [r for r in events if r.get("event") == "order_fail"]
+    variant_fails = [r for r in fail_events if r.get("variant")]
+    main_fails = [r for r in fail_events if not r.get("variant")]
+    if variant_fails:
+        from collections import Counter as _C
+        print("\n---------- 形态对冲分桶（变体 vs 主形态, 码×次数） ----------")
+        vc = _C(r.get("code") for r in variant_fails)
+        mc = _C(r.get("code") for r in main_fails)
+        codes = sorted(set(vc) | set(mc), key=str)
+        print(f"  {'code':<10}{'变体(9130500)':<14}主形态(9110400)")
+        for c in codes:
+            print(f"  {str(c):<10}{vc.get(c, 0):<14}{mc.get(c, 0)}")
+
     # 关键接口响应原文（迭代脚本时看这里：新字段/新风控提示都在原文里）
     key_rows = [r for r in http_rows
                 if any(k in (r.get("api") or "") for k in KEY_APIS)]
