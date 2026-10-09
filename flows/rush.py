@@ -109,18 +109,18 @@ def effective_sale_s(sale_s: float, open_obs_s) -> float:
 
 
 def hedge_worker_ids() -> set:
-    """形态对冲路集合:取一波(在途覆盖段)前 N 路。
+    """形态对冲路集合:worker 1..N(不占哨兵 w0)。
 
     10-08 复盘:对冲放二波末(w13/14)首发 +0.03 恰落 69422 未激活块,
-    6 发预算换 0 个拥挤层样本,实验白做。改放一波(w1/w2)——与主形态
-    同刻到达拥挤层,响应码有无分岔一眼可判。worker-0(哨兵)保持主形态,
-    保证开闸观测序列形态一致。
+    6 发预算换 0 个拥挤层样本,实验白做。改放 w1/w2 与主形态同刻到达
+    拥挤层,响应码有无分岔一眼可判。10-09 A/B 判决零分岔,RUSH_HEDGE_
+    WORKERS 已默认关闭(0),机制保留供未来新假设复用。
     """
     n = max(0, int(getattr(settings, "RUSH_HEDGE_WORKERS", 0) or 0))
-    v1 = max(1, int(getattr(settings, "RUSH_VOLLEY_1", 1)))
+    total = max(1, int(getattr(settings, "RUSH_CONCURRENCY", 1)))
     if n <= 0:
         return set()
-    n = min(n, max(0, v1 - 1))
+    n = min(n, total - 1)
     return set(range(1, 1 + n))
 
 
@@ -284,31 +284,46 @@ class RushFlow:
                 # 多路时串行预热来不及(T-3s 内),线程池并发预热
                 # 多路本身即多连接,每路 1 条;单路才按配置多条
                 from concurrent.futures import ThreadPoolExecutor
-                self._worker_clients = [self.client]
-                for i in range(n_workers - 1):
+                if (isinstance(self.client, BiliClient)
+                        and getattr(self.client, "is_h2", False)):
+                    # H2:全部 worker 共享同一条连接,预热一次即可
+                    # (并发流由齐射时自然建立;连接进池防开售瞬 TLS)
+                    self._worker_clients = [self.client]
+                    per = 2
                     try:
-                        self._worker_clients.append(self._spawn_client())
-                    except Exception:   # 单路创建失败:跳过,少一路不废轮
-                        logger.exception("预热期 worker-%s 创建失败,跳过",
-                                         i + 1)
-                per = (max(1, settings.PREWARM_CONNECTIONS)
-                       if n_workers <= 3 else 1)
-                try:
-                    pool = ThreadPoolExecutor(
-                        max_workers=min(n_workers,
-                                        settings.RUSH_PREWARM_PARALLEL))
-                    try:
-                        times = list(pool.map(
-                            lambda c: c.prewarm(connections=per),
-                            self._worker_clients))
-                    finally:
-                        pool.shutdown(wait=True)
+                        t = self.client.prewarm(connections=per)
+                        times = [t]
+                    except Exception:
+                        logger.exception("H2 预热失败,降级裸连(不影响开抢)")
+                        times = []
                     vals = sorted(t for t in times if t is not None)
                     worst = vals[-1] if vals else None
-                except Exception:   # 线程池整体失败:降级为不预热裸打
-                    logger.exception("并发预热整体失败,降级裸连(不影响开抢)")
-                    worst = None
-                    vals = []
+                else:
+                    self._worker_clients = [self.client]
+                    for i in range(n_workers - 1):
+                        try:
+                            self._worker_clients.append(self._spawn_client())
+                        except Exception:   # 单路创建失败:跳过,少一路不废轮
+                            logger.exception("预热期 worker-%s 创建失败,跳过",
+                                             i + 1)
+                    per = (max(1, settings.PREWARM_CONNECTIONS)
+                           if n_workers <= 3 else 1)
+                    try:
+                        pool = ThreadPoolExecutor(
+                            max_workers=min(n_workers,
+                                            settings.RUSH_PREWARM_PARALLEL))
+                        try:
+                            times = list(pool.map(
+                                lambda c: c.prewarm(connections=per),
+                                self._worker_clients))
+                        finally:
+                            pool.shutdown(wait=True)
+                        vals = sorted(t for t in times if t is not None)
+                        worst = vals[-1] if vals else None
+                    except Exception:   # 线程池整体失败:降级为不预热裸打
+                        logger.exception("并发预热整体失败,降级裸连(不影响开抢)")
+                        worst = None
+                        vals = []
                 self._record(
                     "prewarm", workers=n_workers,
                     ok=bool(worst is not None),
@@ -362,12 +377,17 @@ class RushFlow:
         if not clients:
             clients = [self.client]
             if isinstance(self.client, BiliClient):
-                for i in range(n_workers - 1):
-                    try:
-                        clients.append(self._spawn_client())
-                    except Exception:   # 单路创建失败:跳过该路,不废整轮
-                        logger.exception("worker-%s client 创建失败,跳过",
-                                         i + 1)
+                if getattr(self.client, "is_h2", False):
+                    # H2:全部 worker 共享同一条连接(多路复用,对齐 App
+                    # 传输形态);httpx.Client 线程安全,run_logger 带锁
+                    clients = [self.client] * n_workers
+                else:
+                    for i in range(n_workers - 1):
+                        try:
+                            clients.append(self._spawn_client())
+                        except Exception:   # 单路创建失败:跳过该路,不废整轮
+                            logger.exception("worker-%s client 创建失败,跳过",
+                                             i + 1)
             else:
                 # 测试 mock 客户端:共享同一实例(避免 spawn 真实
                 # BiliClient 发实际网络请求污染测试与外部接口)

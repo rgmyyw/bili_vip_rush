@@ -63,16 +63,16 @@ def test_anchor_combo_pacing(monkeypatch):
     assert e is True and st is False
 
 
-def test_volley_layout_20():
-    """20 路三段梯队:哨兵1+一波7+二波7+余量5,门控边界自洽。"""
+def test_volley_layout_salvo():
+    """H2 齐射布局:哨兵1+齐射29,弹量=预算30;H2 传输对齐开启。"""
     st = rush_mod.settings
     n = int(st.RUSH_CONCURRENCY)
     v1, v2 = int(st.RUSH_VOLLEY_1), int(st.RUSH_VOLLEY_2)
-    assert n == 20
-    assert v1 == 8 and v2 == 7
-    assert v1 + v2 < n          # 余量路存在(锁单回流扫尾)
+    assert n == 30
+    assert v1 == 1 and v2 == 29 and v1 + v2 == n
+    assert st.H2_ENABLED is True
+    assert int(st.RUSH_ATTEMPT_BUDGET) == n   # 齐射一轮=预算,零墙后浪费
     assert 0 < st.RUSH_VOLLEY2_FALLBACK < 1.0
-    assert st.RUSH_TARGET_RPS <= n   # 贴线,不超路数
 
 
 # ------------------------------------------------ 43055 开闸信号

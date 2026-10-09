@@ -232,7 +232,7 @@ def test_spawn_failure_skips_only_that_worker(pause_file, monkeypatch):
     set_paused(False)
 
     from core.client import BiliClient
-    real = BiliClient(run_logger=NullRunLogger(), timeout=1)
+    real = BiliClient(run_logger=NullRunLogger(), timeout=1, h2=False)
     real.get_server_time = lambda: int(_t.time())
     real.get_attract_card = lambda: {"next_open_at": int(_t.time()) + 3600}
     real.create_order = lambda plan: {"order_no": "OK-S"}

@@ -10,6 +10,7 @@ import logging
 import time
 from typing import Any
 
+import httpx
 import requests
 
 from config import settings
@@ -17,6 +18,10 @@ from core.run_logger import NullRunLogger
 from core.signer import signed_params
 
 logger = logging.getLogger(__name__)
+# httpx 默认 INFO 级打印完整请求行(URL query 含 access_key/csrf)——
+# 凭证会落进容器日志/run 文件,必须压到 WARNING(我们有自己的审计日志)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # 引流卡开售状态
 DRAINAGE_ON_SALE = "ON_SALE"
@@ -36,11 +41,21 @@ class BiliApiError(RuntimeError):
 
 
 class BiliClient:
-    def __init__(self, timeout: float = 10.0, run_logger=None):
+    def __init__(self, timeout: float = 10.0, run_logger=None,
+                 h2: bool | None = None):
         self.timeout = timeout
         self.run_logger = run_logger or NullRunLogger()
         self.phase = "init"   # 由 flows 层更新，写入每条 HTTP 日志
-        self.session = requests.Session()
+        # 传输层形态:HTTP/2(ALPN 协商,服务器不支持自动回落 H1)。
+        # 真实 App 走 HTTP/2 单连接多路复用;多 worker 各开 H1 连接是
+        # 教科书级机器人指纹(十天 H1 零穿越的头号嫌疑,10-09 定案)。
+        # H2_ENABLED=False 一键回退旧 H1 多连接形态。
+        self.is_h2 = settings.H2_ENABLED if h2 is None else h2
+        if self.is_h2:
+            self.session = httpx.Client(
+                http2=True, timeout=timeout, follow_redirects=True)
+        else:
+            self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": settings.APP_UA,
             "Referer": "https://www.bilibili.com/blackboard/era/rZPKSDqrJEOrtkVi.html",
@@ -95,7 +110,7 @@ class BiliClient:
                 raise BiliApiError(
                     f"HTTP {resp.status_code} {url}", code=resp.status_code,
                     response_text=text)
-        except requests.RequestException as ex:
+        except (requests.RequestException, httpx.HTTPError) as ex:
             elapsed = (time.monotonic() - t0) * 1000
             self.run_logger.log_http(
                 phase=self.phase, method=method, url=url, params=params,

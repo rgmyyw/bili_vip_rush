@@ -169,15 +169,20 @@ def test_reflow_respects_pause(tmp_path, monkeypatch):
 
 # ------------------------------------------------ 形态对冲
 def test_hedge_worker_ids_default():
-    """默认配置:一波(w1..7)前 2 路 = {1,2},与主形态同刻到达拥挤层。"""
-    ids = hedge_worker_ids()
-    assert ids == {1, 2}
-    v1 = int(st.RUSH_VOLLEY_1)
-    assert ids and ids.issubset(set(range(1, v1)))   # 一波段,不含哨兵 w0
+    """默认关闭(10-09 A/B 零分岔,版本分桶假说出局);开启时取 w1..N。"""
+    assert st.RUSH_HEDGE_WORKERS == 0
+    assert hedge_worker_ids() == set()
+    import unittest.mock as _m
+    with _m.patch.object(st, "RUSH_HEDGE_WORKERS", 2):
+        ids = hedge_worker_ids()
+        n = int(st.RUSH_CONCURRENCY)
+        assert ids == {1, 2}
+        assert ids.issubset(set(range(1, n)))   # 不占哨兵 w0
 
 
-def test_form_hedge_event_and_variant_tags(tmp_path):
+def test_form_hedge_event_and_variant_tags(tmp_path, monkeypatch):
     """复盘留痕:form_hedge 一行自描述 + 对冲路逐发 variant 标记。"""
+    monkeypatch.setattr(st, "RUSH_HEDGE_WORKERS", 2)   # 机制测试:临时启用
     flow = _flow(ReflowClient(), tmp_path)
     flow.rush(target_ts=time.time() - 1, early_seconds=0, duration=0.6)
     evs = _events(tmp_path)
@@ -243,3 +248,45 @@ def test_plain_plan_uses_frozen_build():
     kwargs = req.call_args.kwargs
     assert kwargs["params"]["build"] == st.BUILD
     assert "User-Agent" not in kwargs["headers"]          # 无覆盖头
+
+
+# ------------------------------------------------ H2 传输层
+def test_h2_client_shape():
+    """H2 开启:httpx 会话;关闭:requests 会话(回退路径)。"""
+    from core.client import BiliClient
+    import httpx as _hx
+    import requests as _rq
+    c2 = BiliClient(run_logger=None, timeout=1)
+    c1 = BiliClient(run_logger=None, timeout=1, h2=False)
+    assert c2.is_h2 and isinstance(c2.session, _hx.Client)
+    assert not c1.is_h2 and isinstance(c1.session, _rq.Session)
+    assert c2.session.headers["User-Agent"] == st.APP_UA
+
+
+def test_h2_workers_share_one_client(pause_file, monkeypatch):
+    """H2 下全部 worker 共享同一 client(单连接多路复用对齐 App)。"""
+    import time as _t
+    from flows.rush import RushFlow
+    from core.client import BiliClient
+    monkeypatch.setattr(st, "RUSH_CONCURRENCY", 6)
+    monkeypatch.setattr(st, "ALLOWED_PANEL_TYPES", {"26moe_cdd178"})
+    from core.pause import set_paused
+    set_paused(False)
+    from core.run_logger import NullRunLogger
+    real = BiliClient(run_logger=NullRunLogger(), timeout=1)   # H2 默认开
+    real.get_server_time = lambda: int(_t.time())
+    real.get_attract_card = lambda: {"next_open_at": int(_t.time()) + 3600}
+    real.create_order = lambda plan: {"order_no": "OK-H2"}
+    real.pay_link = lambda p: "http://p"
+    real.get_order_status = lambda o: {"status": 1}
+    real.prewarm = lambda connections=1: 0.01
+    flow = RushFlow(real, plans=[dict(PLAN)], log_dir=tmp_path_factory())
+    order = flow.rush(target_ts=_t.time() - 1, early_seconds=0,
+                      interval=0.01, duration=1.0)
+    assert order and order["order_no"] == "OK-H2"
+
+
+def tmp_path_factory():
+    import tempfile
+    from pathlib import Path
+    return Path(tempfile.mkdtemp())
