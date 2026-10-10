@@ -123,3 +123,31 @@ def test_explicit_max_attempts_reason(tmp_path):
     evs = _events(tmp_path)
     assert any(e.get("event") == "stop_reason"
                and e["reason"] == "max_attempts" for e in evs)
+
+
+def test_h2_prewarm_path_all_workers_enter(tmp_path, monkeypatch):
+    """10-10 事故回归:H2 预热分支只建 1 个引用,rush 使用点必须扩展到
+    齐射路数——否则 30 路只剩哨兵 1 线程(当日仅 9 发,齐射未上场)。"""
+    import time as _t
+    from flows.rush import RushFlow
+    from core.client import BiliClient
+    from core.pause import set_paused
+    set_paused(False)
+    real = BiliClient(run_logger=None, timeout=5)   # H2 默认开
+    real.get_server_time = lambda: int(_t.time())
+    real.get_attract_card = lambda: {"drainage_status": "ON_SALE",
+                                     "next_open_at": _t.time() + 4,
+                                     "current_time": int(_t.time()),
+                                     "isReserved": True, "has_buy": False}
+    from core.client import BiliApiError
+    real.create_order = lambda plan: (_ for _ in ()).throw(
+        BiliApiError("43055", code=43055))
+    real.pay_link = lambda p: "http://pay"
+    real.get_order_status = lambda o: {"status": 1}
+    flow = RushFlow(real, plans=[dict(PLAN)], log_dir=tmp_path)
+    flow.rush(target_ts=_t.time() + 4, interval=None, duration=6.0)
+    f = sorted(tmp_path.glob("run_*.jsonl"))[0]
+    evs = [json.loads(x) for x in
+           f.read_text(encoding="utf-8").splitlines()]
+    workers = {e["worker"] for e in evs if e.get("event") == "order_fail"}
+    assert len(workers) >= 25, f"齐射未全员上场: 仅 {len(workers)} 路进场"

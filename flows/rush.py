@@ -374,6 +374,13 @@ class RushFlow:
         # worker 集合:优先用等待期预热好的;等待循环未走过(如 --now
         # 立即开抢/目标已过)则现场生成,保证并发路数不因路径退化成单路
         clients = list(self._worker_clients or [])
+        if (0 < len(clients) < n_workers
+                and isinstance(self.client, BiliClient)
+                and getattr(self.client, "is_h2", False)):
+            # H2:全部 worker 共享同一条连接——预热分支只建了 1 个引用,
+            # 必须扩展到齐射路数(10-10 事故:预热产出单引用直接作 worker
+            # 集合,30 路只剩哨兵 1 线程,30 发预算仅打出 9 发)
+            clients = [self.client] * n_workers
         if not clients:
             clients = [self.client]
             if isinstance(self.client, BiliClient):
